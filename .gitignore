@@ -1,6 +1,7 @@
 # R
 .Rhistory
 .RData
+.Rdata
 .Rproj.user/
 .Rproj
 .Ruserdata
@@ -8,14 +9,25 @@
 # macOS
 .DS_Store
 
+# IDE
+.vscode/
+.idea/
+
 # outputs / caches
 outputs/
 *.tmp
 *.log
+tmp/
+cache/
 
 # renv local lib (we commit renv.lock, not the library)
 renv/library/
 renv/staging/
+
+# Quarto / knitr
+*_cache/
+*.knit.md
+*.utf8.md
 
 # large binaries (使用 LFS 或外部連結)
 *.pptx
@@ -27,9 +39,10 @@ renv/staging/
 *.csv
 *.xlsx
 *.tsv
-*.proquet
+*.parquet
 *.html
 *.svs
 *.rds
 *.qpproj
 *.RData
+legacy_full/
