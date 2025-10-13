@@ -1,0 +1,35 @@
+# R
+.Rhistory
+.RData
+.Rproj.user/
+.Rproj
+.Ruserdata
+
+# macOS
+.DS_Store
+
+# outputs / caches
+outputs/
+*.tmp
+*.log
+
+# renv local lib (we commit renv.lock, not the library)
+renv/library/
+renv/staging/
+
+# large binaries (使用 LFS 或外部連結)
+*.pptx
+*.pdf
+*.tif
+*.tiff
+*.png
+*.ndpi
+*.csv
+*.xlsx
+*.tsv
+*.proquet
+*.html
+*.svs
+*.rds
+*.qpproj
+*.RData
