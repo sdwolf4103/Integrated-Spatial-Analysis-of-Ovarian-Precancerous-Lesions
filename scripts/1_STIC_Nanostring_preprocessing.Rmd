@@ -1,10 +1,9 @@
 ---
 title: "1_STIC_Nanostring_preprocessing"
-output: html_notebook
+output: html_document
 ---
 
 # Data preprocessing
-
 ## ---- Setup (renv + packages) --------------------------------
 ```{r message=FALSE, warning=FALSE}
 # Activate project library if present
@@ -36,7 +35,7 @@ suppressPackageStartupMessages({
 
 ## –– 0) Project roots & folders ––––––––––––––––
 ```{r}
-root           <- "/Users/sd_wo/Documents/projects/nanostring-paper-code"
+root           <- "Location"
 data_dir       <- normalizePath(file.path(root, "data", "raw"), mustWork = TRUE)
 data_processed <- normalizePath(file.path(root, "data", "processed"), mustWork = FALSE)
 rdata_dir      <- file.path(data_processed, "Rdata")

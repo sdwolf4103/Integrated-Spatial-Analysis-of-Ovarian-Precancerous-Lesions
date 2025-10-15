@@ -1,7 +1,5 @@
 
 # FUNCTION: volcanoPlot() ####
-# This function generates volcano plots and from the output of differential expression analysis.
-# input = limma/TopTable output, title_1/2 = string for the groups in order that they appear in the contrast (i.e. lvi vs stroma), batch = string
 volcanoPlot <- function(input, title_1, title_2, batch, gene = 10, logFC_threshold = 1, pval_threshold = 1.3, upcolor = "firebrick3", downcolor = "steelblue3", directory) {
   # Create output directory if it does not exist
   if (!file.exists(directory)) {

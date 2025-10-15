@@ -1,8 +1,7 @@
 ---
-title: "Final_code_Nanostring"
-author: "Ralph"
-date: "2025-04-30"
+title: "3_STIC_Nanostring_analysis"
 output: html_document
+render_on_save: false
 ---
 ```{r}
 # ---- 1. Activate renv environment if exists ----
@@ -61,7 +60,7 @@ message("✅ All required packages loaded successfully.")
 
 ### RNA Data and Sample Data
 ```{r message=FALSE, warning=FALSE}
-root           <- "/Users/sd_wo/Documents/projects/nanostring-paper-code"
+root           <- "Location"
 data_dir       <- normalizePath(file.path(root, "data", "raw"), mustWork = TRUE)
 data_processed <- normalizePath(file.path(root, "data", "processed"), mustWork = FALSE)
 rdata_dir      <- file.path(data_processed, "Rdata")
