@@ -1,0 +1,2531 @@
+---
+title: "Final_code_Nanostring"
+author: "Ralph"
+date: "2025-04-30"
+output: html_document
+---
+```{r}
+# ---- 1. Activate renv environment if exists ----
+if (file.exists("renv/activate.R")) {
+  message("Activating renv environment...")
+  source("renv/activate.R")
+} else {
+  message("No renv environment found — proceeding with global library.")
+}
+
+# ---- 2. Ensure BiocManager installed ----
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager", repos = "https://cloud.r-project.org")
+}
+
+# ---- 3. Define package lists ----
+cran_pkgs <- c(
+  "dplyr", "tibble", "tidyr", "readr", "readxl", "stringr", "reshape2",
+  "ggplot2", "ggrepel", "ggforce", "ggtext", "ggpubr", "ggnewscale",
+  "circlize", "grid", "plotly", "colorspace", "openxlsx",
+  "umap", "psych","ggalt","igraph", "msigdbr", "org.Hs.eg.db", "AnnotationDbi", "fgsea", "pheatmap"
+)
+
+bioc_pkgs <- c(
+  "DESeq2", "limma", "NMF", "tableone", "Biobase", "ComplexHeatmap","sva", "bluster"
+)
+
+# ---- 4. Install any missing packages ----
+need_cran <- cran_pkgs[!vapply(cran_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+need_bioc <- bioc_pkgs[!vapply(bioc_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+
+if (length(need_cran)) {
+  message("Installing missing CRAN packages: ", paste(need_cran, collapse = ", "))
+  install.packages(need_cran, repos = "https://cloud.r-project.org")
+}
+
+if (length(need_bioc)) {
+  message("Installing missing Bioconductor packages: ", paste(need_bioc, collapse = ", "))
+  BiocManager::install(need_bioc, ask = FALSE, update = TRUE)
+}
+
+# ---- 5. Load libraries quietly ----
+suppressPackageStartupMessages({
+  library(dplyr); library(tibble); library(tidyr); library(readr); library(readxl)
+  library(stringr); library(reshape2); library(ggplot2); library(ggrepel); library(ggforce)
+  library(ggtext); library(ggpubr); library(ggnewscale); library(ComplexHeatmap)
+  library(circlize); library(grid); library(plotly); library(colorspace)
+  library(openxlsx); library(DESeq2); library(limma); library(NMF)
+  library(tableone); library(Biobase); library(umap); library(ggalt); 
+  library(sva); library(igraph); library(bluster); library(msigdbr);library(org.Hs.eg.db);
+  library(AnnotationDbi); library(fgsea); library(pheatmap)
+})
+
+message("✅ All required packages loaded successfully.")
+```
+
+### RNA Data and Sample Data
+```{r message=FALSE, warning=FALSE}
+root           <- "/Users/sd_wo/Documents/projects/nanostring-paper-code"
+data_dir       <- normalizePath(file.path(root, "data", "raw"), mustWork = TRUE)
+data_processed <- normalizePath(file.path(root, "data", "processed"), mustWork = FALSE)
+rdata_dir      <- file.path(data_processed, "Rdata")
+fig_dir        <- file.path(root, "outputs", "figures", "02_analysis")
+table_dir      <- file.path(root, "outputs", "tables")
+
+dir.create(data_processed, recursive = TRUE, showWarnings = FALSE)
+dir.create(rdata_dir,     recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir,       recursive = TRUE, showWarnings = FALSE)
+
+message("root:      ", root)
+message("data_dir:  ", data_dir)
+message("rdata_dir: ", rdata_dir)
+message("fig_dir:   ", fig_dir)
+
+geo_fn <- file.path(root, "script", "STIC_Nanostring_Custom_Functions.R")
+if (file.exists(geo_fn)) source(geo_fn)
+```
+
+### Sample data adjustment
+```{r}
+# ---------------------------------------------------------
+# Load data and annotation data
+# ---------------------------------------------------------
+
+# Load processed count data (vst_limma.xlsx) from processed/Rdata
+count_data <- read_excel(file.path(data_dir, "count_data.xlsx")) %>%
+  as.data.frame() %>%
+  { rownames(.) <- .[[1]]; . } %>%
+  dplyr::select(-1) %>%
+  as.matrix()
+
+# Load annotation metadata (Nanostring_metadata_submit.xlsx) from raw/Data
+anno_data <- read_xlsx(file.path(data_dir, "Nanostring_metadata_submit.xlsx")) %>%
+  as.data.frame()
+
+colnames(anno_data) <- gsub(" ", "_", colnames(anno_data))
+
+anno_data <- anno_data %>%
+  mutate(Diagnosis = case_when(
+    Diagnosis == "STIC" ~ "STIC",
+    Diagnosis == "High grade serous carcinoma" ~ "HGSC",
+    Diagnosis == "Normal fallopian tube epithelium" ~ "NFT",
+    Diagnosis == "STIL" ~ "STIC",
+    Diagnosis == "p53 signature" ~ "p53",
+    Diagnosis == "Clear cell carcinoma" ~ "CCC",
+    Diagnosis == "Endometrial endometrioid carcinoma" ~ "EC",
+    Diagnosis == "Endometrioid carcinoma" ~ "EC",
+    Diagnosis == "Normal mesothelium" ~ "Meso",
+    TRUE ~ Diagnosis
+    ),
+    BRCA_category = recode(
+      BRCA_category,
+      "negative" = "Negative",
+      .default   = BRCA_category
+    ))
+
+anno_data <- as.data.frame(anno_data)
+rownames(anno_data) <- anno_data$SegmentDisplayName
+
+
+# epithelial subset
+anno_data.epi <- anno_data %>%
+  dplyr::filter(
+    type == "epithelium",
+    !Diagnosis %in% c("CCC", "EC")  # exclude other carcinoma types
+  )
+count_data.epi <- count_data[, row.names(anno_data.epi)]
+
+## Adjust data type
+anno_data.epi <- anno_data.epi %>%
+  mutate(
+    type = as.factor(type),
+    Diagnosis = as.factor(Diagnosis),
+    Morphology_category = as.factor(Morphology_category),
+    Ki67_percentage = as.integer(Ki67_percentage),
+    p53_pattern = as.factor(p53_pattern),
+    Stromal_lymphocyte = as.factor(Stromal_lymphocyte),
+    BRCA_category = as.factor(BRCA_category),
+    Molecular_Subtype = factor(
+      Molecular_Subtype,
+      levels = c("NFT", "Dormant", "Mixed", "Immunoreactive", "Proliferative", "HGSC")
+    )
+  )
+```
+
+## Basic plot for PIMD subtypes (Figure 5 A-F)
+```{r message=FALSE, warning=FALSE}
+#--------------------------------------------
+# 1) Output folder
+#--------------------------------------------
+cluster_folder <- file.path(root, "outputs", "figures", "05_pimd_basic")
+dir.create(cluster_folder, recursive = TRUE, showWarnings = FALSE)
+
+#--------------------------------------------
+# 2) Palettes & theme
+#--------------------------------------------
+diagnosis_colors <- c(
+  "NFT"  = "#1f77b4", 
+  "p53"  = "lightblue", 
+  "STIL" = "#2ca02c", 
+  "STIC" = "orange", 
+  "HGSC" = "#d62728"
+)
+cluster_colors <- c(
+  "NFT"            = "#1f77b4",
+  "Dormant"        = "lightblue", 
+  "Mixed"          = "#2ca02c", 
+  "Immunoreactive" = "#fee090", 
+  "Proliferative"  = "orange",
+  "HGSC"           = "#e41a1c"
+)
+Morphology_colors <- c(
+  "Flat" = "#bae4b3", 
+  "BLAD" = "orange"
+)
+Stromal_lymphocyte_colors <- c(
+  "Non-enriched" = "#f7fcf0",
+  "Enriched"     = "#74c476"
+)
+BRCA_colors <- c(
+  "Negative" = "#f7fcf0",
+  "BRCA1"    = "#a6cee3",
+  "BRCA2"    = "#1f78b4",
+  "Other"    = "#fee090"
+)
+
+x_labels <- c(
+  "NFT"            = "NFT", 
+  "Dormant"        = "D", 
+  "Mixed"          = "M", 
+  "Immunoreactive" = "I", 
+  "Proliferative"  = "P", 
+  "HGSC"           = "HGSC"
+)
+
+base_theme <- theme_bw(base_size = 14) +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x     = element_text(size = 10),
+    axis.text.y     = element_text(size = 10),
+    axis.title      = element_text(size = 14),
+    legend.position = "none"
+  )
+
+#--------------------------------------------
+# Plot 1: Ki67 (manual)
+#--------------------------------------------
+p1 <- ggplot(anno_data.epi, aes(Molecular_Subtype, Ki67_percentage, fill = Molecular_Subtype)) +
+  geom_boxplot() +
+  labs(title = "Ki67 Index (Manual)", x = "Molecular Subtype", y = "Ki67 (%)") +
+  scale_fill_manual(values = cluster_colors) +
+  scale_x_discrete(labels = x_labels) +
+  base_theme
+
+print(p1)
+ggsave(
+  file.path(cluster_folder, "Ki67_percentage.png"),
+  plot = p1, width = 4, height = 3.6, dpi = 300
+)
+
+#--------------------------------------------
+# Plot 2: Ki67 (Qupath)  — FULLY COMMENTED OUT AS REQUESTED
+#--------------------------------------------
+# p2 <- ggplot(anno_data.epi, aes(Molecular_Subtype, Ki67_Qupath, fill = Molecular_Subtype)) +
+#   geom_boxplot() +
+#   labs(title = "Ki67 Index (Qupath)", x = "Molecular Subtype", y = "Ki67 (Qupath %)") +
+#   scale_fill_manual(values = cluster_colors) +
+#   scale_x_discrete(labels = x_labels) +
+#   base_theme
+#
+# print(p2)
+# ggsave(
+#   file.path(cluster_folder, "Ki67_Qupath.png"),
+#   plot = p2, width = 4, height = 3.6, dpi = 300
+# )
+
+#--------------------------------------------
+# Plot 3: Age by subtype
+#--------------------------------------------
+p3 <- ggplot(anno_data.epi, aes(Molecular_Subtype, Age, fill = Molecular_Subtype)) +
+  geom_boxplot() +
+  labs(title = "Age by Molecular Subtype", x = "Molecular Subtype", y = "Age (years)") +
+  scale_fill_manual(values = cluster_colors) +
+  scale_x_discrete(labels = x_labels) +
+  base_theme
+
+print(p3)
+ggsave(
+  file.path(cluster_folder, "Age.png"),
+  plot = p3, width = 4, height = 3.6, dpi = 300
+)
+
+#--------------------------------------------
+# Plot 4: Stromal lymphocyte distribution
+#   (uses 'Stromal_lymphocyte' factor)
+#--------------------------------------------
+p4 <- ggplot(anno_data.epi, aes(Molecular_Subtype, fill = Stromal_lymphocyte)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Stromal Lymphocyte Enrichment", x = "Molecular Subtype", y = "Percentage") +
+  scale_fill_manual(values = Stromal_lymphocyte_colors) +
+  scale_x_discrete(labels = x_labels) +
+  base_theme +
+  theme(legend.position = "right", legend.title = element_blank())
+
+print(p4)
+ggsave(
+  file.path(cluster_folder, "Stromal_lymphocyte_Distribution.png"),
+  plot = p4, width = 4, height = 3.6, dpi = 300
+)
+
+#--------------------------------------------
+# Plot 5: Diagnosis distribution
+#--------------------------------------------
+p5 <- ggplot(anno_data.epi, aes(Molecular_Subtype, fill = Diagnosis)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Diagnosis Distribution", x = "Molecular Subtype", y = "Percentage") +
+  scale_fill_manual(values = diagnosis_colors) +
+  scale_x_discrete(labels = x_labels) +
+  base_theme
+
+print(p5)
+ggsave(
+  file.path(cluster_folder, "Diagnosis_Distribution.png"),
+  plot = p5, width = 4, height = 3.6, dpi = 300
+)
+
+#--------------------------------------------
+# Plot 6: BRCA distribution (exclude NFT/HGSC)
+#--------------------------------------------
+filtered_data <- anno_data.epi %>%
+  dplyr::filter(!Molecular_Subtype %in% c("NFT", "HGSC")) %>%
+  dplyr::mutate(
+    BRCA_category = dplyr::recode(
+      BRCA_category,
+      "Other_HR"           = "Other",
+    ),
+    BRCA_category = factor(BRCA_category, levels = c("Other", "Negative", "BRCA2", "BRCA1"))
+  )
+
+p6 <- ggplot(filtered_data, aes(Molecular_Subtype, fill = BRCA_category)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "g-<i>BRCA</i> Status", x = "Molecular Subtype", y = "Percentage") +
+  scale_fill_manual(
+    values = BRCA_colors,
+    labels = c("Other", "Negative", "<i>BRCA2</i>", "<i>BRCA1</i>")
+  ) +
+  scale_x_discrete(labels = x_labels) +
+  base_theme +
+  theme(
+    legend.position = "right",
+    plot.title      = ggtext::element_markdown(),
+    legend.title    = element_blank(),
+    legend.text     = ggtext::element_markdown()
+  )
+
+print(p6)
+ggsave(
+  file.path(cluster_folder, "BRCA_Distribution.png"),
+  plot = p6, width = 4, height = 3.6, dpi = 300
+)
+
+#--------------------------------------------
+# Plot 7: Morphology (BLAD/Flat) by subtype
+#   (exclude NFT/HGSC)
+#--------------------------------------------
+morph_data <- anno_data.epi %>%
+  dplyr::filter(!Molecular_Subtype %in% c("NFT", "HGSC")) %>%
+  dplyr::mutate(Morphology_category = factor(Morphology_category, levels = c("Flat", "BLAD")))
+
+p7 <- ggplot(morph_data, aes(Molecular_Subtype, fill = Morphology_category)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Morphology Subtype", x = "Molecular Subtype", y = "Percentage") +
+  scale_fill_manual(values = Morphology_colors) +
+  scale_x_discrete(labels = x_labels[names(x_labels) != "NFT" & names(x_labels) != "HGSC"]) +
+  base_theme +
+  theme(legend.position = "right", legend.title = element_blank())
+
+print(p7)
+ggsave(
+  file.path(cluster_folder, "Morphology_Distribution.png"),
+  plot = p7, width = 4, height = 3.6, dpi = 300
+)
+
+#--------------------------------------------
+# Plot 8: Ki67 score correlation (Manual vs Qupath)
+#   (keep active if both columns exist; otherwise comment the block)
+#--------------------------------------------
+#plot_data <- anno_data.epi %>%
+#  dplyr::filter(!is.na(Ki67_percentage), !is.na(Ki67_Qupath))
+#
+#p8 <- ggplot(plot_data, aes(Ki67_percentage, Ki67_Qupath)) +
+#  geom_point(alpha = 0.7, color = "steelblue") +
+#  geom_smooth(method = "lm", se = TRUE, linetype = "dashed") +
+#  labs(title = "Comparison of Ki67 Scores", x = "Ki67 (Manual)", y = "Ki67 (Qupath)") +
+#  theme_minimal(base_size = 14)
+#
+#print(p8)
+#ggsave(
+#  file.path(cluster_folder, "Ki67_correlation.png"),
+#  plot = p8, width = 4, height = 3.6, dpi = 300
+#)
+
+rm(filtered_data, morph_data, plot_data)
+```
+
+## Table.1
+```{r}
+# ---------------------------------------------------------------
+# 1) Prepare a clean table_data
+# ---------------------------------------------------------------
+table_data <- anno_data.epi %>%
+  dplyr::transmute(
+    `Molecular Subtype` = factor(
+      Molecular_Subtype,
+      levels = c("Dormant","Mixed","Immunoreactive","Proliferative")
+    ),
+    Age = cut(
+      Age,
+      breaks = seq(30, 80, by = 10),
+      right  = FALSE,
+      labels = paste(seq(30,70,10), seq(39,79,10), sep = "-")
+    ),
+
+    `BRCA germline status` = factor(
+      dplyr::case_when(
+        BRCA_category %in% c("Other_HR","Other") ~ "Other",
+        BRCA_category == "BRCA non-specified"    ~ "Negative",
+        TRUE                                      ~ BRCA_category
+      ),
+      levels = c("Other","Negative","BRCA1","BRCA2")
+    ),
+
+    `p53 pattern` = factor(
+      dplyr::case_when(
+        is.na(p53_pattern) | p53_pattern == "wild type" ~ "wildtype",
+        TRUE                                            ~ p53_pattern
+      ),
+      levels = c("overexpression","loss","wildtype")
+    ),
+
+    `Morphology grade` = factor(
+      dplyr::if_else(Diagnosis %in% c("p53","STIL"), "Low-grade", "High-grade"),
+      levels = c("Low-grade","High-grade")
+    ),
+
+    `Morphologic Subtype` = factor(
+      Morphology_category,
+      levels = c("Flat","BLAD")
+    ),
+
+    `Stromal lymphocytes` = factor(
+      Stromal_lymphocyte,
+      levels = c("Non-enriched","Enriched")
+    ),
+
+#    `Ki67 index` = factor(
+#      cut(Ki67_Qupath, breaks = c(-Inf, 5, 20, Inf),
+#          labels = c("Low (<5%)","Intermediate (5-20%)","High (>20%)"))
+#    )
+  )
+
+# ---------------------------------------------------------------
+# 2) Define which columns to tabulate (all except the stratifier)
+# ---------------------------------------------------------------
+vars <- setdiff(names(table_data), "Molecular_Subtype")
+
+# ---------------------------------------------------------------
+# 3) Create and print Table 1
+# ---------------------------------------------------------------
+table1 <- CreateTableOne(
+  vars       = vars,
+  strata     = "Molecular Subtype",
+  data       = table_data,
+  factorVars = vars
+)
+
+table1
+
+table1_mat <- print(
+  table1,
+  quote         = FALSE,
+  noSpaces      = TRUE,
+  test          = TRUE,
+  showAllLevels = TRUE
+)
+
+table1_df <- as.data.frame(table1_mat, stringsAsFactors = FALSE)
+table1_df
+
+write.csv(table1_df, file = file.path(table_dir, "Table1_demographic_summary.csv"), row.names = TRUE)
+```
+
+```{r}
+# ---------- 1) Prepare a clean table_data ----------
+table_data <- anno_data.epi %>%
+  dplyr::filter(Molecular_Subtype != "Dormant") %>%
+  dplyr::transmute(
+    Molecular_Subtype = factor(
+      Molecular_Subtype,
+      levels = c("Mixed","Immunoreactive","Proliferative")
+    ),
+    Age = cut(
+      Age,
+      breaks = seq(30, 80, by = 10),
+      right  = FALSE,
+      labels = paste(seq(30,70,10), seq(39,79,10), sep = "-")
+    ),
+    `BRCA germline status` = factor(
+      dplyr::case_when(
+        BRCA_category %in% c("Other_HR","Other") ~ "Other",
+        TRUE                                      ~ BRCA_category
+      ),
+      levels = c("Other","Negative","BRCA1","BRCA2")
+    ),
+    `p53 pattern` = factor(
+      dplyr::case_when(
+        is.na(p53_pattern) | p53_pattern == "wild type" ~ "wildtype",
+        TRUE                                            ~ p53_pattern
+      ),
+      levels = c("overexpression","loss","wildtype")
+    ),
+    `Morphology grade` = factor(
+      dplyr::if_else(Diagnosis %in% c("p53","STIL"), "Low-grade", "High-grade"),
+      levels = c("Low-grade","High-grade")
+    ),
+    `Morphologic Subtype` = factor(
+      Morphology_category,
+      levels = c("Flat","BLAD")
+    ),
+    `Stromal lymphocytes` = factor(
+      Stromal_lymphocyte,
+      levels = c("Non-enriched","Enriched")
+    ),
+    # Ki67 Qupath columns are excluded per your request; if you want manual Ki67:
+    # `Ki67 index` = factor(
+    #   cut(Ki67_percentage, breaks = c(-Inf, 5, 20, Inf),
+    #       labels = c("Low (<5%)","Intermediate (5-20%)","High (>20%)"))
+    # )
+  )
+
+# ---------- 2) Choose variables to tabulate (everything except the stratifier) ----------
+vars <- setdiff(names(table_data), "Morphologic Subtype")
+factorVars <- vars
+
+# ---------- 3) Create and print BLAD vs Flat table ----------
+table_blad_flat <- CreateTableOne(
+  vars       = vars,
+  strata     = "Morphologic Subtype",
+  data       = table_data,
+  factorVars = factorVars,
+  test       = TRUE,
+  addOverall = FALSE
+)
+
+# Convert printable matrix -> data.frame for export
+table_blad_flat_mat <- print(
+  table_blad_flat,
+  quote         = FALSE,
+  noSpaces      = TRUE,
+  test          = TRUE,
+  showAllLevels = TRUE,
+  smd           = FALSE,
+  exact         = "asis"
+)
+table_blad_flat_df <- as.data.frame(table_blad_flat_mat, stringsAsFactors = FALSE)
+
+# ---------- 4) Export to CSV ----------
+# use your publication tables folder; adjust if needed
+write.csv(
+  table_blad_flat_df,
+  file = file.path(table_dir, "Sup_Table1_BF_emographic_summary.csv"),
+  row.names = TRUE
+)
+```
+
+
+```{r}
+library(broom)
+# ---- build 2x2 fisher test helper
+fisher_safe <- function(a, b, c, d) {
+  m <- matrix(c(a, b, c, d), nrow = 2, byrow = TRUE,
+              dimnames = list(c("Flat","BLAD"), c("Amp","NoAmp")))
+  broom::tidy(fisher.test(m))
+}
+
+# ---- MYC (Flat 6/20, BLAD 6/10)
+myc_fisher <- fisher_safe(a = 6, b = 14, c = 6, d = 4)
+
+myc_table <- tibble(
+  Marker = "MYC amplification",
+  Flat   = "6/20 (30%)",
+  BLAD   = "6/10 (60%)",
+  `Fisher p` = signif(myc_fisher$p.value, 3)
+)
+
+# ---- CCNE1 (Flat 9/20, BLAD 4/10)
+ccne1_fisher <- fisher_safe(a = 9, b = 11, c = 4, d = 6)
+
+ccne1_table <- tibble(
+  Marker = "CCNE1 amplification",
+  Flat   = "9/20 (45%)",
+  BLAD   = "4/10 (40%)",
+  `Fisher p` = signif(ccne1_fisher$p.value, 3)
+)
+
+# ---- combined table
+amp_table <- dplyr::bind_rows(myc_table, ccne1_table)
+amp_table
+```
+
+
+## UMAP (Figure 1B)
+```{r generate-umap, fig.width=9, fig.height=6, out.width='100%', fig.align='center'}
+# UMAP function with encircling
+umap_function <- function(anno_data, count_data, n_neighbors = 15, n_components = 2, random_state = 25, k = 4, color = NULL, shape = NULL, label = FALSE) {
+  diagnosis_order <- c("NFT", "p53", "STIL", "STIC", "HGSC")
+  anno_data$Diagnosis <- factor(anno_data$Diagnosis, levels = diagnosis_order)
+  umap_results <- umap::umap(t(count_data), n_neighbors = n_neighbors, n_components = n_components, random_state = random_state)
+  umap_plot_df <- data.frame(umap_results$layout) %>%
+    tibble::rownames_to_column("SegmentDisplayName") %>%
+    dplyr::inner_join(anno_data, by = "SegmentDisplayName")
+  graph <- bluster::makeSNNGraph(t(count_data), k = k)
+  clust <- igraph::cluster_louvain(graph)
+  umap_plot_df$clust <- factor(clust$membership)
+  unique_shapes <- unique(umap_plot_df[[shape]])
+  epithelium_data <- umap_plot_df %>% dplyr::filter(!!rlang::ensym(shape) == "epithelium")
+  
+  p <- ggplot(
+    umap_plot_df,
+    aes(
+      x = X1,
+      y = X2,
+      color = !!rlang::ensym(color),
+      shape = !!rlang::ensym(shape)
+    )
+  ) +
+
+    geom_encircle(data = epithelium_data, aes(group = Diagnosis, fill = !!rlang::ensym(color)), 
+                  color = NA, alpha = 0.1, expand = 0.08) +
+    geom_point(size = 3, alpha = 0.8) +
+    scale_shape_manual(values = rep(16:19, length.out = length(unique_shapes))) +
+    scale_color_manual(
+      values = c("NFT" = "#1f77b4", 
+                 "p53" = "#2ca02c", 
+                 "STIL" ="orange", 
+                 "STIC" = "orange", 
+                 "HGSC" = "#d62728"),
+      labels = c("NFT" = "Normal fallopian tube epithelium",
+                 "p53" = "p53 signature",
+                 "STIL" = "STIC",
+                 "STIC" = "STIC",
+                 "HGSC" = "High grade serous carcinoma")
+    ) +
+    
+    # Remove the fill legend for encircling
+    scale_fill_manual(
+      values = c("NFT" = "#1f77b4", 
+                 "p53" = "#2ca02c", 
+                 "STIC" ="orange", 
+                 "STIC" = "orange", 
+                 "HGSC" = "#d62728"),
+      labels = c("NFT" = "Normal fallopian tube epithelium",
+                 "p53" = "p53 signature",
+                 "STIL" = "STIC",
+                 "STIC" = "STIC",
+                 "HGSC" = "High grade serous carcinoma")
+    ) +
+    theme_bw() +
+    labs(
+      x = "UMAP 1", 
+      y = "UMAP 2", 
+      shape = "Specimen type",  
+      color = "Diagnosis" 
+    ) +
+    theme(
+      axis.text.x = element_text(size = 12), 
+      axis.text.y = element_text(size = 12), 
+      axis.title = element_text(size = 14),   
+      legend.title = element_text(face = "bold", size = 12),  
+      legend.text = element_text(size = 12),
+      plot.title = element_text(hjust = 0.5, size = 16, face = "bold")
+    )
+  
+  if (label) {
+    p <- p + geom_text(aes(label = SegmentDisplayName), size = 3, nudge_y = 0.1)
+  }
+  return(p)
+}
+
+set.seed(123)
+anno_data_filtered_UMAP <- anno_data %>%
+  filter(
+    type != "mesothelium" & 
+    !(Diagnosis %in% c("CCC", "EC", "Meso"))
+  )%>%
+  mutate(
+    Diagnosis = dplyr::recode(Diagnosis,
+                              "STIL" = "STIC")
+  )
+rownames(anno_data_filtered_UMAP) <- anno_data_filtered_UMAP$SegmentDisplayName
+count_data_filtered_UMAP <- count_data[, row.names(anno_data_filtered_UMAP)]
+
+
+p <- umap_function(
+  anno_data_filtered_UMAP,
+  count_data_filtered_UMAP,
+  color = "Diagnosis",
+  shape = "type",
+  n_neighbors = 10,       
+  n_components = 2,        
+  random_state = 42,       
+  k = 5,            
+  label = FALSE 
+)
+
+print(p)
+rm(anno_data_filtered_UMAP)
+
+```
+
+
+## RNA DE analysis & volcano plot (Figure 2)
+```{r}
+pheno = new("AnnotatedDataFrame", data=anno_data.epi)
+eset <- ExpressionSet(assayData = as.matrix(count_data.epi), phenoData = pheno)
+anno_data.epi$Molecular_Subtype <- factor(anno_data.epi$Molecular_Subtype)
+
+design <- model.matrix(~0 + pheno$Molecular_Subtype)
+colnames(design) <- levels(pheno$Molecular_Subtype)
+
+contr.matrix <- makeContrasts(
+  NFT_unique_all = NFT - (Mixed + Proliferative + Dormant + Immunoreactive + HGSC)/5,
+  Mixed_unique_all = Mixed - (NFT + Proliferative + Dormant + Immunoreactive + HGSC)/5,
+  Proliferative_unique_all = Proliferative - (NFT + Mixed + Dormant + Immunoreactive + HGSC)/5,
+  Dormant_unique_all = Dormant - (NFT + Mixed + Proliferative + Immunoreactive + HGSC)/5,
+  Immunoreactive_unique_all = Immunoreactive - (NFT + Mixed + Proliferative + Dormant + HGSC)/5,
+  HGSC_unique_all = HGSC - (NFT + Mixed + Proliferative + Dormant + Immunoreactive)/5,
+  Immunoreactive_unique_STIC= Immunoreactive - (Mixed + Proliferative + Dormant)/3,
+  Proliferative_unique_STIC= Proliferative - (Mixed + Immunoreactive + Dormant)/3,
+  Dormant_unique_STIC= Dormant - (Mixed + Proliferative + Immunoreactive)/3,
+  Mixed_unique_STIC= Mixed - (Immunoreactive + Proliferative + Dormant)/3,
+  Dormant_NFT=Dormant-NFT,
+  Mixed_NFT=Mixed-NFT,
+  Immunoreactive_NFT=Immunoreactive-NFT,
+  Proliferative_NFT=Proliferative-NFT,
+  HGSC_NFT=HGSC-NFT,
+  HGSC_p= HGSC - Proliferative,
+  HGSC_PandI= HGSC- (Immunoreactive + Proliferative)/2,
+  HGSC_STIC = HGSC - (Mixed + Proliferative + Dormant + Immunoreactive)/4,
+  HGSC_and_STICvsNFT = (HGSC + Mixed + Proliferative + Dormant + Immunoreactive)/5 - NFT,
+  PMI_D = (Mixed + Proliferative + Immunoreactive)/3 - Dormant,
+  levels = colnames(design)
+)
+
+# Fit the linear model with limma
+fit <- lmFit(eset, design)
+vfit <- contrasts.fit(fit, contrasts = contr.matrix)
+efit <- eBayes(vfit)
+
+# Extract differentially expressed genes for each contrast using topTreat
+contrast_names <- colnames(contr.matrix)
+
+res_list <- setNames(
+  lapply(contrast_names, function(nm) limma::topTreat(efit, coef = nm, n = Inf)),
+  contrast_names
+)
+
+
+## Extract top50 genes from different classes
+unique_contrasts <- c("NFT_unique", "Mixed_unique", "Proliferative_unique",
+                      "Dormant_unique", "Immunoreactive_unique", "HGSC_unique")
+results_list <- list(
+  NFT_unique = NFT_unique,
+  Mixed_unique = Mixed_unique,
+  Proliferative_unique = Proliferative_unique,
+  Dormant_unique = Dormant_unique,
+  Immunoreactive_unique = Immunoreactive_unique,
+  HGSC_unique = HGSC_unique
+)
+
+unique_all <- c(
+  "NFT_unique_all","Mixed_unique_all","Proliferative_unique_all",
+  "Dormant_unique_all","Immunoreactive_unique_all","HGSC_unique_all"
+)
+
+top50_unique <- lapply(res_list[unique_all], function(tab) head(tab, 50))
+genes_top <- unique(unlist(lapply(top50_unique, rownames)))
+
+# optional matrices if you need them later
+top_50_count_data   <- count_data_combined[genes_top, , drop = FALSE]
+high_var_count_data <- count_data_combined[apply(count_data_combined, 1, var, na.rm = TRUE) > 0.9, , drop = FALSE]
+
+```
+
+###Volcano plot (Figure2)
+```{r}
+# output folder (adjust to your project)
+out_dir <- file.path(root, "outputs", "figures", "02_volcano")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# helper to render & save one volcano
+save_volcano <- function(coef_name, title1, title2, genes, file_stub) {
+  stopifnot(coef_name %in% names(res_list))
+  p <- plot_DE_list(res_list[[coef_name]], title_1 = title1, title_2 = title2, gene_list = genes)
+  ggplot2::ggsave(filename = file.path(out_dir, paste0(file_stub, ".png")),
+                  plot = p, width = 6, height = 6, dpi = 300)
+}
+
+# specify your panels once, then loop
+volcano_specs <- list(
+  # STIC subtype “unique within STIC”
+  list(coef="Dormant_unique_STIC",       t1="Dormant STIC",       t2="Others",
+       genes=c("OVGP1","CRISP3","DNAAF1","SPATA18","CFAP157","SLC72A","TPPP3","ANO1",
+               "CTSH","CLU","CAPS","FOXJ1","TIMP3","MXRA8","COL6A2","SPARC","DCN",
+               "ACTA2","IGF","IGFBP2","PRAME","NOTCH3","PGR"),
+       file="Dormant_unique_STIC"),
+  list(coef="Mixed_unique_STIC",         t1="Mixed STIC",         t2="Others",
+       genes=c("MMP7","CP","CFB","MUC1","MUC16","MT1E","HLA-DRA","HLA-DRB1","HLA-DPB1",
+               "HLA-E","CXCL2","C3","CD74","CD9","CD24","TCIM","IFI27","H1-5","H1-4",
+               "H1-2","MT1X","CDK16","SOX4","SOX17","CLDN3","RPN1","FTH1","CRISP3",
+               "PAX2","CDH4","SOX3","PRR23D2","HOXA3","FAM90A1","CHRNA4","PAX2"),
+       file="Mixed_unique_STIC"),
+  list(coef="Immunoreactive_unique_STIC",t1="Immunoreactive STIC",t2="Others",
+       genes=c("HLA-DRA","HLA-DRB1","HLA-DPB1","HLA-DPA1","HLA-E","HLA-B","HLA-DMA",
+               "HLA-DQB1","HLA-DQA1","HLA-A","HLA-DQA2","HLA-DOA","CXCL17","CXCL1",
+               "CXCL2","CXCL8","C3","C4B","CD74","CD14","LCN2","CIITA","TAP2","A2M",
+               "B2M","OVGP1","LGR5","PAX2","TPPP3","CRISP3","RPS19","RPS21","RPL11",
+               "RPL18","RPL23","RPS16","BCAM","TGFB2","MGMT","IGFBP2","SPINT2","SOX4"),
+       file="Immunoreactive_unique_STIC"),
+  list(coef="Proliferative_unique_STIC", t1="Proliferative STIC", t2="Others",
+       genes=c("OVGP1","CRISP3","NPDC1","TPPP3","CTSH","H3C2","IGFBP2","STMN1","KIFC1",
+               "PRAME","CRABP2","SOX4","DBN1","SPINT2","NOTCH3","TSMB10","CFAP157",
+               "DNAAF1","NOTCH3","DDX39A","MEX3A","MCM7","TSMB10","MSLN","H3-3A","BCAM",
+               "HPN","MFAP2","LSR","DACH1","UBE2C","LAMA5","CD9","SOX17","CA12","TACC1",
+               "FASN","LAMC1","NOTCH3","NACC1","CD47"),
+       file="Proliferative_unique_STIC"),
+
+  # HGSC comparisons
+  list(coef="HGSC_p",          t1="HGSC", t2="Proliferative STIC",
+       genes=c("ATF3","TBX2","HPN","SLC7A2","CDH2","SPINT2","RBP1","PAX8","AR",
+               "STMN1","CDH1","JUN","CRISP3","COL1A1","ISG15","SPP1","BST2","COL3A1",
+               "L1CAM","TMEM123","S100A4","IFI30","IFI27","MMP11","IFI6","OAS1",
+               "BIRC2","BIRC3","OAS3","COL5A1","COL4A1","IGF2","CLDN16","MX1","IFIT1",
+               "MMP1","IFI44","IFI30","TIMP3","YAP1"),
+       file="HGSC_P"),
+  list(coef="HGSC_PandI",      t1="HGSC", t2="Proliferative and Immunoreactive STIC",
+       genes=c("ATF3","TBX2","SLC7A2","CDH2","RBP1","AR","RRAD","CDH1","JUN","COL1A1",
+               "ISG15","SPP1","BST2","COL3A1","L1CAM","TMEM123","S100A4","IFI30","IFI27",
+               "MMP11","IFI6","OAS1","BIRC2","OAS3","COL5A1","COL4A1","IGF2","CLDN16",
+               "MX1","IFIT1","MMP1","IFI44","IFI30","TIMP3","CFI","SLC2A1","YAP1"),
+       file="HGSC_PandI"),
+  list(coef="HGSC_STIC",       t1="HGSC", t2="All STIC",
+       genes=c("ATF3","TBX2","SLC7A2","RBP1","AR","CDH1","JUN","CRISP3","COL1A1","ISG15",
+               "SPP1","BST2","COL3A1","L1CAM","TMEM123","S100A4","IFI30","IFI27","MMP11",
+               "IFI6","OAS1","BIRC2","OAS3","COL5A1","COL4A1","IGF2","CLDN16","MX1",
+               "IFIT1","MMP1","IFI44","IFI30","TIMP3","SLC2A1","YAP1"),
+       file="HGSC_STIC"),
+
+  # Dormant vs NFT (your old “vol1” is actually Dormant_NFT)
+  list(coef="Dormant_NFT",     t1="Dormant STIC", t2="NFT",
+       genes=c("STMN1","MYC","ADCY8","IFITM1","MARCKSL1","H1-5","PPA1","THY1","CDK4",
+               "CDK16","LMNB1","RESF1","CA12","LEF1","MEX3A","WEE1","BEX2","LAMB3","AGR2",
+               "LCN2","CRISP3","PAX2","IGFBP7","ERP27","SOCS3","PRKAR1A","DNAI2",
+               "PRKAR1A","ITGA3","LRRC46","DEFB124","GAS2L2","DNAH9"),
+       file="Dormant_NFT")
+)
+
+# run all volcanoes
+invisible(lapply(volcano_specs, function(x) {
+  save_volcano(coef_name = x$coef, title1 = x$t1, title2 = x$t2, genes = x$genes, file_stub = x$file)
+}))
+```
+
+### DE data saving
+```{r}
+## ---------------------------------------------------------------
+## DE data saving (Supplemental Data, all in one list) — UPDATED
+## ---------------------------------------------------------------
+
+library(data.table)
+
+logFC_threshold <- 0.5
+pval_threshold  <- 1.3
+gene_top        <- 30
+
+de_dir <- file.path(root, "outputs", "DE")
+dir.create(de_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Core DE contrasts
+de_specs <- list(
+  list(coef = "Dormant_NFT",        t1 = "Dormant",        t2 = "NFT",          subdir = "Dormant_NFT"),
+  list(coef = "Mixed_NFT",          t1 = "Mixed",          t2 = "NFT",          subdir = "Mixed_NFT"),
+  list(coef = "Immunoreactive_NFT", t1 = "Immunoreactive", t2 = "NFT",          subdir = "Immunoreactive_NFT"),
+  list(coef = "Proliferative_NFT",  t1 = "Proliferative",  t2 = "NFT",          subdir = "Proliferative_NFT"),
+  list(coef = "HGSC_NFT",           t1 = "HGSC",           t2 = "NFT",          subdir = "HGSC_NFT"),
+  list(coef = "HGSC_and_STICvsNFT", t1 = "HGSC and STIC",  t2 = "NFT",          subdir = "HGSCandSTIC_NFT"),
+
+  list(coef = "PMI_D",                        t1 = "PMI",            t2 = "Dormant",     subdir = "PMI_vs_Dormant"),
+  list(coef = "Dormant_unique_STIC",          t1 = "Dormant",        t2 = "Others",      subdir = "Dormant_vs_Others"),
+  list(coef = "Mixed_unique_STIC",            t1 = "Mixed",          t2 = "Others",      subdir = "Mixed_vs_Others"),
+  list(coef = "Immunoreactive_unique_STIC",   t1 = "Immunoreactive", t2 = "Others",      subdir = "Immunoreactive_vs_Others"),
+  list(coef = "Proliferative_unique_STIC",    t1 = "Proliferative",  t2 = "Others",      subdir = "Proliferative_vs_Others")
+)
+
+for (spec in de_specs) {
+  if (!spec$coef %in% names(res_list)) {
+    message("⚠️ Skipping ", spec$coef, " (not found in res_list)")
+    next
+  }
+  this_dir <- file.path(de_dir, spec$subdir)
+  dir.create(this_dir, recursive = TRUE, showWarnings = FALSE)
+
+  cat("▶ Volcano for:", spec$coef, "\n")
+
+  volcanoPlot(
+    res_list[[spec$coef]],
+    title_1         = spec$t1,
+    title_2         = spec$t2,
+    batch           = "Differential_Expression",
+    logFC_threshold = logFC_threshold,
+    pval_threshold  = pval_threshold,
+    gene            = gene_top,
+    directory       = this_dir
+  )
+
+  # Export the DE table too
+  fwrite(
+    res_list[[spec$coef]],
+    file = file.path(this_dir, paste0(spec$coef, "_DE_results.csv")),
+    row.names = FALSE
+  )
+}
+```
+
+## Pathway (Figure 2)
+
+```{r}
+# --- paths & gene sets ---
+hallmark_path     <- file.path(root, "R", "h.all.v2023.2.Hs.entrez.gmt")
+pathway_dir       <- file.path(root, "outputs", "figures", "02_pathway")
+dir.create(pathway_dir, recursive = TRUE, showWarnings = FALSE)
+pathways.hallmark <- gmtPathways(hallmark_path)
+
+## ----UNCTION ----
+run_fgsea_once <- function(de_table, de_name, output_dir, output_file,
+                           top_n = 15, bottom_n = 15,
+                           prefix_to_strip = "HALLMARK_",
+                           char_to_strip   = "_",
+                           pathway_set     = pathways.hallmark) {
+
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # 1) Prepare stats vector (ENTREZ)
+  gene_symbols <- rownames(de_table)
+  foldchanges  <- de_table$logFC
+
+  entrezIDs <- AnnotationDbi::mapIds(
+    org.Hs.eg.db,
+    keys     = gene_symbols,
+    column   = "ENTREZID",
+    keytype  = "SYMBOL",
+    multiVals = "first"
+  )
+
+  stats <- foldchanges
+  names(stats) <- entrezIDs
+  stats <- stats[!is.na(names(stats))]
+
+  # 2) Run fgsea & tidy results
+  fgseaRes <- fgsea(pathway_set, stats = stats)
+
+  fgseaTidy <- fgseaRes %>%
+    as_tibble() %>%
+    arrange(NES) %>%
+    dplyr::select(pathway, NES, padj) %>%
+    mutate(
+      pathway = pathway %>%
+        sub(prefix_to_strip, "", .) %>%
+        gsub(char_to_strip, " ", .)
+    )
+
+  # 3) Pick top & bottom
+  top_tbl    <- fgseaTidy %>% slice_head(n = top_n)
+  bottom_tbl <- fgseaTidy %>% slice_tail(n = bottom_n)
+  plot_tbl   <- bind_rows(top_tbl, bottom_tbl)
+
+  # 4) Plot
+  p <- ggplot(plot_tbl, aes(
+    x    = reorder(pathway, NES),
+    y    = NES,
+    fill = padj < 0.05
+  )) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_manual(
+      name   = "P-value",
+      values = c("TRUE" = "orange", "FALSE" = "steelblue2"),
+      labels = c("TRUE" = "p < 0.05", "FALSE" = "p ≥ 0.05")
+    ) +
+    labs(
+      title = de_name,
+      x     = "Pathway",
+      y     = "Normalized Enrichment Score"
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      plot.title   = element_text(hjust = 1, face = "bold", size = 16),
+      axis.text.x  = element_text(size = 12),
+      axis.text.y  = element_text(size = 10),
+      axis.title   = element_text(size = 14),
+      legend.title = element_text(size = 12),
+      legend.text  = element_text(size = 10)
+    )
+
+  print(p)
+
+  # 5) Save
+  ggsave(
+    filename = file.path(output_dir, output_file),
+    plot     = p,
+    width    = 6,
+    height   = 6,
+    dpi      = 300
+  )
+}
+
+## ---- DEFINE THE RUN LIST (your four contrasts) ----
+de_jobs <- list(
+  list(tab = HGSC_STIC,    name = "HGSC/All STIC",
+       dir = file.path(pathway_dir, "HGSC_vs_AllSTIC"),
+       file = "pathway_HGSC_STIC.png"),
+
+  list(tab = Dormant_NFT,  name = "Dormant/NFT",
+       dir = file.path(pathway_dir, "Dormant_NFT"),
+       file = "pathway_Dormant_NFT.png"),
+
+  list(tab = HGSC_P,       name = "HGSC/Proliferative STIC",
+       dir = file.path(pathway_dir, "HGSC_vs_Proliferative"),
+       file = "pathway_HGSC_P.png"),
+
+  list(tab = HGSC_PandI,   name = "HGSC/Proliferative and Immunoreactive",
+       dir = file.path(pathway_dir, "HGSC_vs_Prolif_Immune"),
+       file = "pathway_HGSC_PandI.png")
+)
+
+## ---- LOOP (skips gracefully if an object is missing) ----
+for (job in de_jobs) {
+  if (!exists(deparse(substitute(job$tab))) && is.null(job$tab)) next
+  if (is.null(job$tab)) next
+  run_fgsea_once(
+    de_table    = job$tab,
+    de_name     = job$name,
+    output_dir  = job$dir,
+    output_file = job$file,
+    top_n       = 15,
+    bottom_n    = 15,
+    pathway_set = pathways.hallmark  # same object you already use
+  )
+}
+```
+
+### Pathway loading
+```{r}
+library(org.Hs.eg.db)
+library(msigdbr)
+library(purrr)
+
+
+# --- Paths ---
+hallmark_path <- file.path(root, "R/h.all.v2023.2.Hs.entrez.gmt")
+pathway_dir   <- file.path(root, "outputs", "figures", "02_pathway")
+dir.create(pathway_dir, recursive = TRUE, showWarnings = FALSE)
+
+# --- Load local GMT file as pathway list ---
+pathways.hallmark <- gmtPathways(hallmark_path)
+
+# --- Helper: convert DE table → ranked stats (ENTREZ IDs) ---
+de_to_stats <- function(de_tab) {
+  s <- if (!is.null(de_tab$t)) de_tab$t else de_tab$logFC
+  gene_symbols <- rownames(de_tab)
+
+  entrez <- AnnotationDbi::mapIds(
+    org.Hs.eg.db,
+    keys    = gene_symbols,
+    column  = "ENTREZID",
+    keytype = "SYMBOL",
+    multiVals = "first"
+  )
+
+  names(s) <- entrez
+  s <- s[!is.na(names(s))]
+  s <- tapply(s, names(s), function(v) v[which.max(abs(v))]) |> unlist()
+  s[is.finite(s)]
+}
+
+# --- Core fgsea runner ---
+run_fgsea_hallmark <- function(de_tab, contrast_name, title_text, out_dir,
+                               pathways = pathways.hallmark,
+                               top_n = 15, bottom_n = 15) {
+  stats <- de_to_stats(de_tab)
+
+  fg <- fgsea(pathways = pathways, stats = stats,
+              minSize = 10, maxSize = 5000)
+
+  fg_tidy <- as_tibble(fg) %>%
+    arrange(NES) %>%
+    mutate(
+      pathway = sub("^HALLMARK_", "", pathway),
+      pathway = gsub("_", " ", pathway)
+    )
+
+  # Top and bottom sets
+  top_tbl    <- fg_tidy |> arrange(desc(NES)) |> slice_head(n = top_n)
+  bottom_tbl <- fg_tidy |> arrange(NES)       |> slice_head(n = bottom_n)
+  plot_tbl   <- bind_rows(top_tbl, bottom_tbl)
+
+  # Plot
+  p <- ggplot(plot_tbl, aes(x = reorder(pathway, NES), y = NES, fill = padj < 0.05)) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_manual(
+      name   = "padj",
+      values = c(`TRUE` = "orange", `FALSE` = "steelblue2"),
+      labels = c(`TRUE` = "padj < 0.05", `FALSE` = "padj ≥ 0.05")
+    ) +
+    labs(
+      title = title_text,
+      x     = "Pathway",
+      y     = "Normalized Enrichment Score"
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      plot.title   = element_text(hjust = 1, face = "bold", size = 16),
+      axis.text.x  = element_text(size = 12),
+      axis.text.y  = element_text(size = 10),
+      axis.title   = element_text(size = 14),
+      legend.title = element_text(size = 12),
+      legend.text  = element_text(size = 10)
+    )
+
+  # Save outputs
+  fwrite(fg_tidy, file.path(out_dir, paste0(contrast_name, "_Hallmark_fgsea.csv")))
+  ggsave(file.path(out_dir, paste0(contrast_name, "_Hallmark_fgsea.png")),
+         plot = p, width = 7, height = 7, dpi = 300)
+  message("✅ Saved Hallmark fgsea for ", contrast_name)
+}
+
+
+# Loop through all DE contrasts
+for (spec in de_specs) {
+  coef_name <- spec$coef
+  if (!coef_name %in% names(res_list)) {
+    message("⚠️ Skipping ", coef_name, " (not found in res_list)")
+    next
+  }
+  out_dir <- file.path(pathway_dir, spec$subdir)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  title_text <- paste0(spec$t1, " vs ", spec$t2, " — Hallmark")
+  run_fgsea_hallmark(res_list[[coef_name]], coef_name, title_text, out_dir)
+}
+```
+
+```{r}
+# 1) Hallmark gene sets keyed by SYMBOL (no org.Hs.eg.db needed)
+species <- "Homo sapiens"
+pathways.hallmark.symbol <- msigdbr(species = species, category = "H") %>%
+  dplyr::filter(!is.na(gene_symbol)) %>%
+  split(.$gs_name) %>%
+  purrr::map(~ unique(.x$gene_symbol))
+
+# 2) Turn a DE table into a named numeric vector (names = SYMBOL)
+de_to_stats_symbol <- function(de_tab) {
+  s <- if (!is.null(de_tab$t)) de_tab$t else de_tab$logFC
+  names(s) <- rownames(de_tab)         # rownames are SYMBOLs in your DE tables
+  s <- s[!is.na(names(s)) & names(s) != ""]
+  # collapse duplicate symbols by max |stat|
+  s <- tapply(s, names(s), function(v) v[which.max(abs(v))]) |> unlist()
+  s[is.finite(s)]
+}
+
+# 3) Example runner (use your existing loop with res_list & de_specs)
+run_fgsea_hallmark_symbol <- function(de_tab, contrast_name, title_text, out_dir,
+                                      pathways = pathways.hallmark.symbol,
+                                      top_n = 15, bottom_n = 15) {
+  stats <- de_to_stats_symbol(de_tab)
+  # keep only genes present in at least one pathway to speed up
+  universe <- unique(unlist(pathways))
+  stats <- stats[names(stats) %in% universe]
+
+  fg <- fgsea(pathways, stats, minSize = 10, maxSize = 5000)
+  fg_tidy <- as_tibble(fg) %>%
+    arrange(NES) %>%
+    mutate(pathway = gsub("^HALLMARK_", "", pathway),
+           pathway = gsub("_", " ", pathway))
+
+  top_tbl    <- fg_tidy |> arrange(desc(NES)) |> slice_head(n = top_n)
+  bottom_tbl <- fg_tidy |> arrange(NES)       |> slice_head(n = bottom_n)
+  plot_tbl   <- bind_rows(top_tbl, bottom_tbl)
+
+  p <- ggplot(plot_tbl, aes(x = reorder(pathway, NES), y = NES, fill = padj < 0.05)) +
+    geom_col() + coord_flip() +
+    scale_fill_manual(values = c(`TRUE`="orange", `FALSE`="steelblue2"),
+                      labels = c(`TRUE`="padj < 0.05", `FALSE`="padj ≥ 0.05"),
+                      name = "padj") +
+    labs(title = title_text, x = "Pathway", y = "NES") +
+    theme_bw(base_size = 14)
+
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  fwrite(fg_tidy, file.path(out_dir, paste0(contrast_name, "_Hallmark_fgsea.csv")))
+  ggsave(file.path(out_dir, paste0(contrast_name, "_Hallmark_fgsea.png")),
+         plot = p, width = 7, height = 7, dpi = 300)
+}
+
+# then loop your de_specs:
+pathway_dir <- file.path(root, "outputs", "figures", "02_pathway")
+for (spec in de_specs) {
+  if (!spec$coef %in% names(res_list)) next
+  out_dir   <- file.path(pathway_dir, spec$subdir)
+  title_txt <- paste0(spec$t1, " vs ", spec$t2, " — Hallmark")
+  run_fgsea_hallmark_symbol(res_list[[spec$coef]], spec$coef, title_txt, out_dir)
+}
+```
+
+
+
+### Pathway all compare to NFT (Supplemental Figure 3A)
+```{r}
+set.seed(1234)
+# --------------------------------------------
+# Paths
+# --------------------------------------------
+run_fgsea <- function(res, hallmark_path, comparison_name) {
+  # Map gene symbols to ENTREZ IDs
+  res$SYMBOL <- mapIds(
+    org.Hs.eg.db,
+    keys = rownames(res),
+    column = 'ENTREZID',
+    keytype = 'SYMBOL',
+    multiVals = "first"
+  )
+  
+  foldchanges <- res$logFC
+  names(foldchanges) <- res$SYMBOL
+  
+  pathways.hallmark <- gmtPathways(hallmark_path)
+  foldchanges_clean <- foldchanges[!is.na(names(foldchanges))]
+  foldchanges_clean <- foldchanges_clean[!duplicated(names(foldchanges_clean))]
+  fgseaRes <- fgsea(
+    pathways = pathways.hallmark,
+    stats    = foldchanges_clean
+  )
+  fgseaResTidy <- fgseaRes %>%
+    as_tibble() %>%
+    arrange(desc(NES)) %>%
+    mutate(Comparison = comparison_name)%>%
+  mutate(pathway = gsub("HALLMARK_", "", pathway),       # Remove "HALLMARK_"
+         pathway = gsub("_", " ", pathway))  
+  return(fgseaResTidy)
+}
+
+
+hallmark_path <- file.path(root, "R/h.all.v2023.2.Hs.entrez.gmt")
+fgsea_dSTIC    <- run_fgsea(Dormant_NFT, hallmark_path, "dSTIC/NFT")
+fgsea_mSTIC    <- run_fgsea(Mixed_NFT, hallmark_path, "mSTIC/NFT")
+fgsea_iSTIC    <- run_fgsea(Immunoreactive_NFT, hallmark_path, "iSTIC/NFT")
+fgsea_pSTIC    <- run_fgsea(Proliferative_NFT, hallmark_path, "pSTIC/NFT")
+fgsea_HGSC    <- run_fgsea(HGSC_NFT, hallmark_path, "HGSC/NFT")
+
+
+all_fgsea_results <- bind_rows(fgsea_dSTIC, fgsea_mSTIC, fgsea_iSTIC, fgsea_pSTIC, fgsea_HGSC)
+
+p_combined <- ggplot(all_fgsea_results, aes(x = reorder(pathway, NES), y = NES, fill = Comparison)) +
+  geom_col(position = position_dodge(width = 0.7)) +
+  coord_flip() +
+  labs(x = "Pathway", y = "Normalized Enrichment Score",
+       title = "Combined fgsea Results for All Comparisons") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 8),
+    axis.title = element_text(size = 14)
+  )
+print(p_combined)
+
+
+selected_pathways <- c(
+  "E2F TARGETS",
+  "G2M CHECKPOINT",
+  "MYC TARGETS V2",
+  "KRAS SIGNALING DN",
+  "EPITHELIAL MESENCHYMAL TRANSITION",
+  "WNT BETA CATENIN SIGNALING",
+  "ALLOGRAFT REJECTION",
+  "MITOTIC SPINDLE",
+  "PI3K AKT MTOR SIGNALING",
+  "MYC TARGETS V1",
+  "MTORC1 SIGNALING",
+  "UNFOLDED PROTEIN RESPONSE",
+  "ADIPOGENESIS",
+  "GLYCOLYSIS",
+  "TGF BETA SIGNALING",
+  "HEDGEHOG SIGNALING",
+  "APICAL JUNCTION",
+  "UV RESPONSE UP",
+  "UV RESPONSE DN",
+  "ANGIOGENESIS",
+  "ANDROGEN RESPONSE",
+  "COAGULATION",
+  "DNA REPAIR",
+  "OXIDATIVE PHOSPHORYLATION",
+  "PROTEIN SECRETION",
+  "PEROXISOME",
+  "FATTY ACID METABOLISM",
+  "REACTIVE OXYGEN SPECIES PATHWAY",
+  "NOTCH SIGNALING",
+  "HYPOXIA",
+  "INTERFERON ALPHA RESPONSE",
+  "INTERFERON GAMMA RESPONSE",
+  "INFLAMMATORY RESPONSE",
+  "IL2 STAT5 SIGNALING",
+  "IL6 JAK STAT3 SIGNALING",
+  "APOPTOSIS",
+  "APICAL SURFACE",
+  "MYOGENESIS",
+  "TNFA SIGNALING VIA NFKB",
+  "XENOBIOTIC METABOLISM",
+  "ESTROGEN RESPONSE LATE",
+  "ESTROGEN RESPONSE EARLY",
+  "P53 PATHWAY"
+)
+
+
+plot_data <- all_fgsea_results %>%
+  filter(pathway %in% selected_pathways) %>%
+  mutate(pathway = factor(pathway, levels = rev(selected_pathways)))
+
+# Re-plot
+p_selected <- ggplot(plot_data, aes(x = pathway, y = NES, fill = Comparison)) +
+  geom_col(position = position_dodge(width = 0.7)) +
+  coord_flip() +
+  labs(
+    x = "Pathway",
+    y = "Normalized Enrichment Score",
+    title = "Selected Hallmark Pathways"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.text.x     = element_text(size = 12),
+    axis.text.y     = element_text(size = 10),  # smaller so long names fit
+    axis.title      = element_text(size = 14)
+  )
+
+print(p_selected)
+
+comparison_colors <- c(
+  "dSTIC/NFT" = "steelblue2",
+  "mSTIC/NFT" = "#74c476",
+  "iSTIC/NFT" = "orange",
+  "pSTIC/NFT" = "#e41a1c",
+  "HGSC/NFT" = "red4"
+)
+
+# 2. Make sure 'Comparison' is a factor with levels in that order
+plot_data <- plot_data %>%
+  mutate(
+    Comparison = factor(Comparison, levels = names(comparison_colors))
+  )
+
+# 3. Re‑plot using scale_fill_manual()
+p_selected_rev <- ggplot(plot_data, aes(x = pathway, y = NES, fill = Comparison)) +
+  geom_col(position = position_dodge(width = 0.7)) +
+  coord_flip() +
+  scale_fill_manual(values = comparison_colors) +
+  labs(
+    x = "Pathway",
+    y = "Normalized Enrichment Score",
+    title = "Hallmark Pathways"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title  = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 10),
+    axis.title  = element_text(size = 14)
+  )
+
+print(p_selected_rev)
+
+# --------------------------------------------
+# Save outputs (PNG)
+# --------------------------------------------
+ggsave(file.path(pathway_dir, "pathway_all.png"), plot = p_selected,
+       width = 8, height = 6, dpi = 300)
+
+```
+
+## Combine lollipop plot (Figure 3C)
+```{r}
+res1<- transform_data(
+  filepath = file.path(root, "outputs/DE/Dormant_NFT/Differential_Expression_DormantvsNFT_all_genes.csv"),
+  name = "Dormant"
+)
+res2<- transform_data(
+  filepath = file.path(root, "outputs/DE/Mixed_NFT/Differential_Expression_MixedvsNFT_all_genes.csv"),
+  name = "Mixed"
+)
+res3<- transform_data(
+  filepath = file.path(root, "outputs/DE/Immunoreactive_NFT/Differential_Expression_ImmunoreactivevsNFT_all_genes.csv"),
+  name = "Immunoreactive"
+)
+res4<- transform_data(
+  filepath = file.path(root, "outputs/DE/Proliferative_NFT/Differential_Expression_ProliferativevsNFT_all_genes.csv"), 
+  name = "Proliferative"
+)
+res5<- transform_data(
+  filepath = file.path(root, "outputs/DE/HGSC_NFT/Differential_Expression_HGSCvsNFT_all_genes.csv"), 
+  name = "HGSC"
+)
+
+# Combine all tables into one data frame
+combined_data <- rbind(res1, res2, res3, res4, res5)
+
+# Reshape data for heatmap plotting
+heatmap_data <- dcast(combined_data, chr + pathway ~ dataset, value.var = "result", fill = 0)
+
+heatmap_data <- heatmap_data[, c("chr", "pathway", "HGSC", "Proliferative", "Immunoreactive", "Mixed", "Dormant")]
+
+# Sort the pathways by chr_id
+heatmap_data$pathway <- factor(heatmap_data$pathway, levels = unique(heatmap_data$pathway[order(heatmap_data$chr)]))
+
+
+chr_boundaries <- heatmap_data %>%
+  group_by(chr) %>%
+  summarise(position = max(as.numeric(pathway))) %>%
+  ungroup()
+
+## No focet
+ggplot(melt(heatmap_data, id.vars = c("chr", "pathway")), aes(x = pathway, y = variable, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "steelblue2", mid = "white", high = "firebrick2", midpoint = 0) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 4.5),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    legend.position = "none"
+  ) +
+geom_vline(data = chr_boundaries, aes(xintercept = position + 0.5), color = "black", linetype = "dashed", size = 0.5)
+
+## No focet complete
+chr_centers <- heatmap_data %>%
+  group_by(chr) %>%
+  summarise(center = (min(as.numeric(as.factor(pathway))) + max(as.numeric(as.factor(pathway)))) / 2)
+
+# Create a named vector for custom x-axis labels
+x_labels <- rep("", length(unique(heatmap_data$pathway)))
+x_labels[round(chr_centers$center)] <- as.character(chr_centers$chr)
+
+# Melt the heatmap data and store it in a variable
+melted_data <- melt(heatmap_data, id.vars = c("chr", "pathway"))
+
+facet_labels <- c("chr1" = "Chr1", "chr2" = "Chr2", "chr3" = "Chr3", "chr4" = "Chr4", "chr5" = "Chr5", "chr6" = "Chr6","chr7" = "Chr7", "chr8" = "Chr8", "chr9" = "Chr9","chr10" = "Chr10", "chr11" = "Chr11", "chr12" = "Chr12","chr13" = "Chr13", "chr14" = "Chr14", "chr15" = "Chr15","chr16" = "Chr16", "chr17" = "Chr17", "chr18" = "18","chr19" = "19", "chr20" = "20", "chr21" = "21","chr22" = "22", "chrX" = "ChrX")
+
+
+library(gridExtra)
+heatmap_data$row_group <- ifelse(heatmap_data$chr %in% paste0("chr", 1:8), "Row 1 (chr1-chr8)", "Row 2 (chr9-chrX)")
+
+heatmap_data_row1 <- subset(heatmap_data, chr %in% paste0("chr", 1:8))
+heatmap_data_row2 <- subset(heatmap_data, chr %in% c(paste0("chr", 9:22), "chrX"))
+
+# Check and convert measure columns to numeric
+heatmap_data_row1[, c("HGSC", "Proliferative", "Immunoreactive", "Mixed", "Dormant")] <- lapply(heatmap_data_row1[, c("HGSC", "Proliferative", "Immunoreactive", "Mixed", "Dormant")], function(x) as.numeric(as.character(x)))
+heatmap_data_row2[, c("HGSC", "Proliferative", "Immunoreactive", "Mixed", "Dormant")] <- lapply(heatmap_data_row2[, c("HGSC", "Proliferative", "Immunoreactive", "Mixed", "Dormant")], function(x) as.numeric(as.character(x)))
+
+# Melt the data after ensuring numeric type and drop NA values
+melted_data_row1 <- melt(heatmap_data_row1, id.vars = c("chr", "pathway", "row_group"), na.rm = TRUE)
+melted_data_row2 <- melt(heatmap_data_row2, id.vars = c("chr", "pathway", "row_group"), na.rm = TRUE)
+
+# Create the first plot for chr1 to chr8
+plot1 <- ggplot(melted_data_row1, aes(x = pathway, y = variable, fill = value)) +
+  geom_tile() +
+  geom_hline(yintercept = seq(0.5, length(unique(melted_data_row1$variable)) - 0.5, by = 1), color = "black", size = 0.2) +
+  scale_fill_gradient2(low = "steelblue2", mid = "white", high = "firebrick2", midpoint = 0) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 6),
+    axis.text.y = element_text(size = 12, face = "bold"),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    legend.position = "none",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 10, face = "bold")
+  ) +
+  facet_grid(cols = vars(chr), scales = "free_x", space = "free_x", labeller = labeller(chr = facet_labels)) +
+  scale_x_discrete(labels = function(x) gsub("chr", "", x))
+
+# Create the second plot for chr9 to chrX
+plot2 <- ggplot(melted_data_row2, aes(x = pathway, y = variable, fill = value)) +
+  geom_tile() +
+  geom_hline(yintercept = seq(0.5, length(unique(melted_data_row1$variable)) - 0.5, by = 1), color = "black", size = 0.2) +
+  scale_fill_gradient2(low = "steelblue2", mid = "white", high = "firebrick2", midpoint = 0) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 6),
+    axis.text.y = element_text(size = 12, face = "bold"),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    legend.position = "none",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 10, face = "bold")
+  ) +
+  facet_grid(cols = vars(chr), scales = "free_x", space = "free_x", labeller = labeller(chr = facet_labels)) +
+  scale_x_discrete(labels = function(x) gsub("chr", "", x))
+
+# Combine the plots vertically
+grid.arrange(plot1, plot2, nrow = 2)
+
+combined_plot <- arrangeGrob(plot1, plot2, nrow = 2)
+
+
+ggsave(
+  filename = paste0(directory, "/NMF/NO_NFT_HGSC/Cluster4/combine_plot_chr.png"),
+  plot = combined_plot,
+  width = 16,
+  height = 4.8,
+  dpi = 300
+)
+
+library(cowplot)
+# Create a custom legend
+legend <- ggplot() +
+  theme_void() +
+  theme(
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  )+
+  annotate("text", x = 2, y = 1.5, label = "  ", size = 5, fontface = "bold") +
+  annotate("rect", xmin = 0.5, xmax = 0.515, ymin = 0.5, ymax = 1, fill = "firebrick2", color = "black") +
+  annotate("text", x = 0.53, y = 0.75, label = "Gene upregulated", size = 4, hjust = 0) +
+  annotate("rect", xmin = 0.8, xmax = 0.815, ymin = 0.5, ymax = 1, fill = "steelblue2", color = "black") +
+  annotate("text", x = 0.830, y = 0.75, label = "Gene downregulated", size = 4, hjust = 0) +
+  annotate("text", x = 0.55, y = -0.75, label = " ", size = 4, hjust = 0)
+
+# Combine the plots and legend
+final_plot <- plot_grid(
+  plot1,
+  plot2,
+  legend,
+  ncol = 1,
+  rel_heights = c(1, 1, 0.3)
+)
+
+# Display the final combined plot
+print(final_plot)
+
+ggsave(
+  filename = paste0(directory, "/NMF/NO_NFT_HGSC/Cluster4/chr_all_combine_legend.png"),
+  plot = final_plot,
+  width = 16,
+  height = 4.8,
+  dpi = 300
+)
+```
+
+
+## Heatmap
+### All epithelium with molecular subtype (Figure 1C)
+```{r heatmap, fig.width=12, fig.height=8}
+
+library(pheatmap)
+diagnosis_colors <- c(
+  "NFT"  = "#1f77b4", 
+  "p53"  = "lightblue", 
+  "STIL" = "#2ca02c", 
+  "STIC" = "orange", 
+  "HGSC" = "#d62728"
+)
+
+p53_colors <- c(
+  "loss" = "#d9d9d9",  
+  "overexpression" = "brown", 
+  "wildtype" = "lightblue"
+)
+
+Stromal_lymphocyte_colors <- c(
+  "Non-enriched" = "#f7fcf0",  
+  "Enriched" = "#74c476"
+)
+
+annotation_colors <- list(
+  "Morphology diagnosis" = diagnosis_colors,
+  'p53 pattern' = p53_colors,
+  'Stromal lymphocytes' = TIL2_colors,
+  'Molecular Subtype' = cluster_colors 
+)
+
+annotation <- data.frame(
+  Stromal_lymphocyte = anno_data.epi$Stromal_lymphocyte,
+  p53_pattern = anno_data.epi$p53_pattern,
+  Diagnosis = anno_data.epi$Diagnosis,
+  Molecular_Subtype = anno_data.epi$Molecular_Subtype
+)
+row.names(annotation) <- row.names(anno_data.epi)
+annotation$Molecular_Subtype <- factor(annotation$Molecular_Subtype, levels = names(cluster_colors))
+diagnosis_order <- c("NFT", "p53", "STIL", "STIC", "HGSC")
+annotation$Diagnosis <- factor(annotation$Diagnosis, levels = diagnosis_order)
+annotation$p53_pattern <- factor(annotation$p53_pattern, levels = names(p53_colors))
+annotation$Stromal_lymphocyte <- factor(annotation$Stromal_lymphocyte, levels = names(Stromal_lymphocyte_colors))
+
+ord <- with(annotation, order(Molecular_Subtype, Diagnosis, p53_pattern, Stromal_lymphocyte))
+colnames(annotation) <- c("Stromal lymphocytes", "p53 pattern","Morphology diagnosis", "Molecular Subtype")
+annotation_ordered <- annotation[ord, ]
+filtered_genes_ordered <- top_50_count_data[, row.names(annotation_ordered)]
+
+# Load necessary libraries
+library(ComplexHeatmap)
+library(circlize)
+# Perform row scaling: rows are genes
+scaled_genes <- t(scale(t(filtered_genes_ordered)))
+ha <- HeatmapAnnotation(
+  `Morphology diagnosis` = annotation_ordered$`Morphology diagnosis`,
+  `p53 pattern` = annotation_ordered$`p53 pattern`,
+  `Stromal lymphocytes` = annotation_ordered$`Stromal lymphocytes`,
+  col = list(
+    `Stromal lymphocytes` = Stromal_lymphocyte_colors,
+    `p53 pattern` = p53_colors,
+    `Morphology diagnosis` = diagnosis_colors
+  ),
+  # Make annotation legends match the size/style of the main heatmap legend
+  annotation_legend_param = list(
+    title_gp = gpar(fontsize = 16, fontface = "bold"),  
+    labels_gp = gpar(fontsize = 16)                  
+  ),
+  annotation_name_gp = gpar(fontsize = 16) # For annotation *names* at the top
+)
+
+# Color function remains from -3 to 3
+col_fun <- colorRamp2(seq(-3, 3, length.out = 200),
+                      colorRampPalette(c("blue", "white", "red"))(200))
+
+Heatmap(
+  scaled_genes,
+  name = "Scaled\nExpression",
+  col = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  show_row_names = FALSE,
+  show_column_names = FALSE,
+  top_annotation = ha,
+  column_split = annotation_ordered$Molecular_Subtype,
+  heatmap_legend_param = list(title = "Expression", at = seq(-3.5, 3.5, by = 1))
+)
+
+# # Save Heatmap
+# png(filename = paste0(directory, "/NMF/NO_NFT_HGSC/Cluster4/heatmap_molecular.png"), width =6400, height = 3200, res = 300)
+# 
+# ht <- Heatmap(
+#   scaled_genes,
+#   name = "Scaled\nExpression",
+#   col = col_fun,
+#   cluster_rows = TRUE,
+#   cluster_columns = FALSE,
+#   show_row_names = FALSE,
+#   show_column_names = FALSE,
+#   top_annotation = ha,
+#   # Facet columns by Molecular Subtype
+#   column_split = annotation_ordered$Molecular_Subtype,
+#   # Increase font size and optionally make it bold
+#   column_title_gp = gpar(fontsize = 18, fontface = "bold"),
+#   # Optional: control the heatmap legend fonts
+#   heatmap_legend_param = list(
+#     title = "Expression", 
+#     at = seq(-3.5, 3.5, by = 1),
+#     title_gp = gpar(fontsize = 16, fontface = "bold"),
+#     labels_gp = gpar(fontsize = 16)
+#   )
+# )
+# 
+# # Draw the heatmap
+# draw(ht)
+# dev.off()
+```
+
+### Heatmap epithelium original (Supplemental Figure 1A)
+```{r}
+# palettes (add stromal if not defined)
+diagnosis_colors <- c("NFT"="#1f77b4","p53"="lightblue","STIC"="orange","HGSC"="#d62728")
+p53_colors <- c("loss"="#d9d9d9","overexpression"="brown","wildtype"="lightblue")
+Stromal_lymphocyte_colors <- c("Non-enriched"="#f7fcf0","Enriched"="#74c476")  # <- consistent name
+
+# use same matrices you already made
+filtered_genes_var <- high_var_count_data[, row.names(anno_data.epi)]
+scaled_genes_var   <- t(scale(t(filtered_genes_var)))
+
+col_fun <- colorRamp2(seq(-3, 3, length.out = 200),
+                      colorRampPalette(c("blue","white","red"))(200))
+
+# --- recode p53: NA -> "wildtype"; also collapse "wild type" & "mosaic" if present ---
+anno_data.epi$p53_plot <- dplyr::case_when(
+  is.na(anno_data.epi$p53_pattern)           ~ "wildtype",
+  anno_data.epi$p53_pattern == "wild type"   ~ "wildtype",
+  anno_data.epi$p53_pattern == "mosaic"      ~ "overexpression",
+  TRUE                                       ~ as.character(anno_data.epi$p53_pattern)
+)
+anno_data.epi$p53_plot <- factor(anno_data.epi$p53_plot,
+                                 levels = c("overexpression","loss","wildtype"))
+
+# --- top annotation (use consistent stromal name & new p53_plot) ---
+ha2 <- HeatmapAnnotation(
+  Diagnosis             = anno_data.epi$Diagnosis,
+  `Stromal lymphocyte`  = anno_data.epi$Stromal_lymphocyte,  # make sure this column is named exactly like this in your data
+  `p53 pattern`         = anno_data.epi$p53_plot,
+  col = list(
+    Diagnosis            = diagnosis_colors,
+    `Stromal lymphocyte` = Stromal_lymphocyte_colors,
+    `p53 pattern`        = p53_colors
+  ),
+  annotation_name_side    = "left",
+  annotation_legend_param = list(
+    title_gp  = gpar(fontsize = 12, fontface = "bold"),
+    labels_gp = gpar(fontsize = 10)
+  )
+)
+
+ht2 <- Heatmap(
+  scaled_genes_var,
+  name               = "Scaled\nExpression",
+  col                = col_fun,
+  cluster_rows       = TRUE,
+  cluster_columns    = TRUE,
+  show_row_names     = FALSE,
+  show_column_names  = FALSE,
+  top_annotation     = ha2,
+  heatmap_legend_param = list(
+    title = "Expression",
+    at    = seq(-3.5, 3.5, by = 1),
+    title_gp  = gpar(fontsize = 16, fontface = "bold"),
+    labels_gp = gpar(fontsize = 16)
+  )
+)
+
+png(file.path(directory, "NMF/NO_NFT_HGSC/Cluster4/heatmap_original.png"),
+    width = 6400, height = 3200, res = 300)
+draw(ht2)
+dev.off()
+```
+### Heatmap epithelium original (Supplemental Figure 1B)
+```{r}
+anno_data.stroma <- anno_data %>%
+  filter(type == "stroma", !Diagnosis %in% c("Meso", "EC", "EEC", "CCC"))
+count_data.stroma <- count_data[,rownames(anno_data.stroma)]
+anno_data.stroma$Molecular_Subtype <- anno_data$Molecular_Subtype[
+  match(anno_data.stroma$Stroma, rownames(anno_data))
+]
+
+
+samples_stroma <- rownames(anno_data.stroma)
+expr_mat_stroma <- count_data[, samples_stroma]
+gene_vars <- apply(expr_mat_stroma, 1, var, na.rm = TRUE)
+filtered_genes_var.stroma <- expr_mat_stroma[gene_vars > 0.9, , drop = FALSE]
+scaled_genes_var.stroma <- t(scale(t(filtered_genes_var.stroma)))
+
+
+annotation_stroma <- data.frame(
+  Diagnosis            = anno_data.stroma$Diagnosis,
+  `Stromal lymphocyte` = anno_data.stroma$Stromal_lymphocyte,
+  row.names            = rownames(anno_data.stroma),
+  check.names          = FALSE    # ✱ keep your spaces exactly
+)
+
+annotation_stroma$Diagnosis            <- factor(annotation_stroma$Diagnosis, levels = names(diagnosis_colors))
+annotation_stroma$`Stromal lymphocyte` <- factor(annotation_stroma$`Stromal lymphocyte`, levels = names(Stromal_lymphocyte_colors))
+
+
+ha_stroma <- HeatmapAnnotation(
+  df  = annotation_stroma,
+  col = list(
+    Diagnosis            = diagnosis_colors,
+    `Stromal lymphocyte` = Stromal_lymphocyte_colors
+  ),
+  annotation_name_side    = "left",
+  annotation_legend_param = list(
+    title_gp  = gpar(fontsize = 12, fontface = "bold"),
+    labels_gp = gpar(fontsize = 10)
+  )
+)
+
+
+col_fun <- colorRamp2(
+  seq(-3, 3, length.out = 200),
+  colorRampPalette(c("blue","white","red"))(200)
+)
+
+
+ht_stroma <- Heatmap(
+  scaled_genes_var.stroma,
+  name                 = "Scaled\nExpression",
+  col                  = col_fun,
+  cluster_rows         = TRUE,
+  cluster_columns      = TRUE,
+  show_row_names       = FALSE,
+  show_column_names    = FALSE,
+  top_annotation       = ha_stroma,
+  heatmap_legend_param = list(
+    title     = "Expression",
+    at        = seq(-3, 3, by = 1),
+    title_gp  = gpar(fontsize = 12, fontface = "bold"),
+    labels_gp = gpar(fontsize = 10)
+  )
+)
+
+print(ht_stroma)
+# # Save to PNG
+# png(
+#   filename = file.path(directory, "NMF/NO_NFT_HGSC/Cluster4/heatmap_stroma.png"),
+#   width    = 6400,
+#   height   = 3200,
+#   res      = 300
+# )
+# draw(ht_stroma)
+# dev.off()
+```
+
+
+
+## PCA plot
+```{r message=FALSE, warning=FALSE}
+selected_clusters <- c("Dormant", "Mixed", "Immunoreactive", "Proliferative")
+anno_subset <- anno_data.epi %>% 
+  filter(Molecular_Subtype %in% selected_clusters)
+genes_subset <- top_50_count_data[, row.names(anno_subset)]
+
+# ---- 1. Flat PCA Plot ----
+pca_res <- prcomp(t(genes_subset), scale. = TRUE)
+pca_df <- as.data.frame(pca_res$x[, 1:2])
+colnames(pca_df) <- c("PC1", "PC2")
+pca_df$Molecular_Subtype <- as.factor(anno_subset$Molecular_Subtype[match(rownames(pca_df), row.names(anno_subset))])
+
+# Plot PCA colored by Molecular_Subtype:
+pca_plot <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Molecular_Subtype)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(
+    title = "PCA of Molecular Subtypes",
+    x = "PC1",
+    y = "PC2"
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = cluster_colors[selected_clusters])
+pca_plot
+
+# ---- 2. Dendrogram of Group Average Profiles ----
+group_profiles <- sapply(selected_clusters, function(cl) {
+  samples <- colnames(genes_subset)[anno_subset$Molecular_Subtype == cl]
+  rowMeans(genes_subset[, samples, drop = FALSE])
+})
+group_profiles <- as.data.frame(group_profiles)
+group_dist <- dist(t(group_profiles))
+hc <- hclust(group_dist, method = "average")
+plot(hc, main = "Dendrogram of Molecular_Subtype Average Profiles (Molecular_Subtypes 1-4)",
+     xlab = "Molecular_Subtype", sub = "", ylab = "Euclidean Distance")
+
+#---- 3. Flat PCA Plot with Background Color ----
+library(dplyr)
+group_colors <- c("Dormant" = "#1f77b4", 
+                  "Mixed" = "#74c476", 
+                  "Immunoreactive" = "orange", 
+                  "Proliferative" = "#e41a1c")
+
+
+# Perform PCA on the gene expression data (samples in columns)
+pca_res <- prcomp(t(genes_subset), scale. = TRUE)
+pca_df <- as.data.frame(pca_res$x[, 1:2])
+colnames(pca_df) <- c("PC1", "PC2")
+
+# Add Molecular_Subtype info (matching sample IDs via row.names)
+pca_df$Molecular_Subtype <- as.factor(anno_subset$Molecular_Subtype[match(rownames(pca_df), row.names(anno_subset))])
+
+# Compute Molecular_Subtype centers (median of PC1 and PC2 for each Molecular_Subtype)
+centers_pca <- pca_df %>%
+  group_by(Molecular_Subtype) %>%
+  summarize(PC1_center = median(PC1, na.rm = TRUE),
+            PC2_center = median(PC2, na.rm = TRUE)) %>%
+  ungroup()
+
+# Create darkened colors for text labels
+darkened_colors <- sapply(names(group_colors), function(cl) darken(group_colors[cl], amount = 0.3))
+names(darkened_colors) <- names(group_colors)
+
+pca_plot <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Molecular_Subtype)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_density2d(aes(fill = Molecular_Subtype), geom = "polygon", alpha = 0.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  scale_color_manual(values = group_colors[selected_clusters]) +
+  scale_fill_manual(values = group_colors[selected_clusters]) +
+  labs(title = "PCA of Molecular Profiles with Density Contours",
+       x = "PC1",
+       y = "PC2") +
+  theme_classic() +
+  theme(legend.position = "none") +
+  new_scale_color() +
+  geom_text(data = centers_pca,
+            aes(x = PC1_center, y = PC2_center, label = Molecular_Subtype, color = Molecular_Subtype),
+            size = 5, fontface = "bold", inherit.aes = FALSE) +
+  scale_color_manual(values = darkened_colors[selected_clusters])
+pca_plot
+```
+## PCA plot 3D (Figure 1D)
+```{r}
+pca_res <- prcomp(t(genes_subset), scale. = TRUE)
+pca_df <- as.data.frame(pca_res$x[, 1:3])
+colnames(pca_df) <- c("PC1", "PC2", "PC3")
+pca_df$Molecular_Subtype <- as.factor(anno_subset$Molecular_Subtype[match(rownames(pca_df), row.names(anno_subset))])
+
+centers_pca_3d <- pca_df %>%
+  group_by(Molecular_Subtype) %>%
+  summarize(PC1_center = median(PC1, na.rm = TRUE),
+            PC2_center = median(PC2, na.rm = TRUE),
+            PC3_center = median(PC3, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(label = as.character(Molecular_Subtype))
+
+group_colors <- c("Dormant" = "#1f77b4", 
+                  "Mixed" = "#74c476", 
+                  "Immunoreactive" = "orange", 
+                  "Proliferative" = "#e41a1c")
+
+selected_clusters <- c("Dormant", "Mixed", "Immunoreactive", "Proliferative")
+dark_cluster_colors <- darken(group_colors, amount = 0.3)
+
+
+pca_3d_plot <- plot_ly() %>%
+  # Add points layer:
+  add_trace(data = pca_df,
+            x = ~PC1, y = ~PC2, z = ~PC3,
+            type = "scatter3d",
+            mode = "markers",
+            marker = list(size = 4, opacity = 0.8),
+            color = ~Molecular_Subtype,
+            colors = group_colors[selected_clusters]) %>%
+  # Add text labels for centers:
+  add_trace(data = centers_pca_3d,
+            x = ~PC1_center, y = ~PC2_center, z = ~PC3_center,
+            type = "scatter3d",
+            mode = "text",
+            text = ~label,
+            textposition = "top center",
+            # Note: In Plotly, setting a vector of text colors usually requires that the data
+            # include such values. One way is to add a column to centers_pca_3d.
+            textfont = list(size = 12,
+                            color = dark_cluster_colors[as.character(centers_pca_3d$Molecular_Subtype)])) %>%
+  layout(
+    title = "3D PCA of Molecular Profiles",
+    scene = list(
+      xaxis = list(title = "PC1"),
+      yaxis = list(title = "PC2"),
+      zaxis = list(title = "PC3")
+    )
+  )
+
+pca_3d_plot
+
+################### hard cloud
+library(plotly)
+library(dplyr)
+library(colorspace)
+library(geometry)  # for convhulln
+group_colors <- c("Dormant" = "#1f77b4", 
+                  "Mixed" = "#74c476", 
+                  "Immunoreactive" = "orange", 
+                  "Proliferative" = "#e41a1c")
+# The selected subtypes (if you need to subset the available colors):
+selected_clusters <- c("Dormant", "Mixed", "Immunoreactive", "Proliferative")
+
+# Create darkened colors for the text labels:
+dark_cluster_colors <- darken(group_colors, amount = 0.8)
+
+# 5. Create the base 3D scatter plot using plotly:
+pca_3d_plot <- plot_ly() %>%
+  # Points layer:
+  add_trace(data = pca_df,
+            x = ~PC1, y = ~PC2, z = ~PC3,
+            type = "scatter3d",
+            mode = "markers",
+            marker = list(size = 3, opacity = 0.8),
+            color = ~Molecular_Subtype,
+            colors = group_colors[selected_clusters]
+  ) %>%
+  # Text labels for centers:
+  add_trace(data = centers_pca_3d,
+            x = ~PC1_center, y = ~PC2_center, z = ~PC3_center,
+            type = "scatter3d",
+            mode = "text",
+            text = ~label,
+            textposition = "center",
+            textfont = list(
+              size = 16,
+              color = dark_cluster_colors[as.character(centers_pca_3d$Molecular_Subtype)]
+            )
+  ) %>%
+  layout(
+    title = "3D PCA of Molecular Profiles",
+    scene = list(
+      xaxis = list(title = "PC1"),
+      yaxis = list(title = "PC2"),
+      zaxis = list(title = "PC3")
+    ),
+    showlegend = FALSE
+  )
+
+# 6. Add convex hull meshes for each molecular subtype if there are at least 4 points.
+unique_subtypes <- levels(pca_df$Molecular_Subtype)
+for(cl in unique_subtypes) {
+  pts <- pca_df %>% filter(Molecular_Subtype == cl)
+  if(nrow(pts) >= 4) {
+    # Compute the convex hull (returns a matrix with each row a triangular facet)
+    hull <- convhulln(as.matrix(pts[, c("PC1", "PC2", "PC3")]), options = "Qt")
+    pca_3d_plot <- pca_3d_plot %>% add_trace(
+      type = "mesh3d",
+      x = pts$PC1,
+      y = pts$PC2,
+      z = pts$PC3,
+      i = hull[, 1] - 1,
+      j = hull[, 2] - 1,
+      k = hull[, 3] - 1,
+      opacity = 0.09,
+      name = cl,
+      showscale = FALSE,
+      facecolor = rep(group_colors[cl], nrow(hull))
+    )
+  }
+}
+
+# Display the final plot
+pca_3d_plot
+pca_3d_plot <- pca_3d_plot %>%
+  layout(
+    paper_bgcolor = "white",
+    plot_bgcolor  = "white",
+    showlegend = FALSE,
+    legend = list(x = 1.05, y = 0.5),
+    scene = list(
+      xaxis = list(
+        title = "PC1",
+        showgrid = TRUE,
+        zeroline = TRUE,
+        showline = TRUE,
+        linecolor = "black",
+        linewidth = 3,
+        backgroundcolor = "white"
+      ),
+      yaxis = list(
+        title = "PC2",
+        showgrid = TRUE,
+        zeroline = TRUE,
+        showline = TRUE,
+        linecolor = "black",
+        linewidth = 3,
+        backgroundcolor = "white"
+      ),
+      zaxis = list(
+        title = "PC3",
+        showgrid = TRUE,
+        zeroline = TRUE,
+        showline = TRUE,
+        linecolor = "black",
+        linewidth = 3,
+        backgroundcolor = "white"
+      ),
+      camera = list(
+        eye = list(x = 1.8, y = 1.8, z = 1.8)
+      )
+    ),
+    title = ""
+  )
+```
+
+## Molecular distance (Figure 1E, 1F)
+```{r message=FALSE, warning=FALSE}
+output_dir <- file.path(root,"figures/01_molecular_distance")
+anno_data.epimeso <- anno_data %>%
+  filter(type %in% c("mesothelium", "epithelium")) %>%
+  filter(!Diagnosis %in% c("EC", "CCC"))
+rownames(anno_data.epimeso) <- anno_data.epimeso$SegmentDisplayName
+
+count_data.epimeso <- count_data[, row.names(anno_data.epimeso)]
+
+gene_vars <- apply(count_data.epimeso, 1, var)
+filtered_data <- count_data.epimeso[gene_vars>0.9, ]
+filtered_data <- count_data.epimeso[genes_top, ]
+
+# 2) Identify the sample names for each reference group
+ref0_idx <- which(anno_data.epi$Molecular_Subtype == "NFT")
+ref5_idx <- which(anno_data.epi$Molecular_Subtype == "HGSC")
+refmeso_idx <- which(anno_data.epimeso$type == "mesothelium")
+
+ref0_names <- rownames(anno_data.epi)[ref0_idx]
+ref5_names <- rownames(anno_data.epi)[ref5_idx]
+refmeso_names <- rownames(anno_data.epimeso)[refmeso_idx]
+
+# 3) Compute the mean expression profile for each reference
+ref0_profile <- rowMeans(filtered_data[, ref0_names, drop = FALSE])
+ref5_profile <- rowMeans(filtered_data[, ref5_names, drop = FALSE])
+refmeso_profile <- rowMeans(filtered_data[, refmeso_names, drop = FALSE])
+
+# 4) For each sample in filtered_data, compute distance to ref0, ref5, meso
+samples_all <- colnames(filtered_data)
+distance_mat_3ref <- sapply(samples_all, function(samp) {
+  expr_samp <- filtered_data[, samp]
+  d0    <- as.numeric(dist(rbind(expr_samp, ref0_profile)))
+  d5    <- as.numeric(dist(rbind(expr_samp, ref5_profile)))
+  dmeso <- as.numeric(dist(rbind(expr_samp, refmeso_profile)))
+  c(d0, d5, dmeso)
+})
+# Convert to data frame
+df_3ref <- as.data.frame(t(distance_mat_3ref))
+colnames(df_3ref) <- c("dist_to_NFT","dist_to_HGSC","dist_to_Meso")
+
+# 5) Add cluster info (or subtype info) from anno_data.epi
+df_3ref$Molecular_Subtype <- anno_data.epi$Molecular_Subtype[match(samples_all, rownames(anno_data.epi))]
+df_3ref$sample  <- samples_all
+
+df_3ref <- df_3ref %>%
+  filter(Molecular_Subtype %in% c("Dormant", "Mixed", "Immunoreactive", "Proliferative")) 
+
+# Define cluster colors if you like
+group_colors <- c("Dormant" = "#1f77b4", 
+                  "Mixed" = "#74c476", 
+                  "Immunoreactive" = "orange", 
+                  "Proliferative" = "#e41a1c")
+library(plotly)
+fig <- plot_ly(
+  data = df_3ref,
+  x = ~dist_to_NFT,
+  y = ~dist_to_HGSC,
+  z = ~dist_to_Meso,
+  color = ~Molecular_Subtype,
+  colors = group_colors,
+  type = "scatter3d",
+  mode = "markers",
+  marker = list(size = 4, opacity = 0.8)
+) %>%
+  layout(
+    title = "3D Distances to NFT / HGSC / Mesothelium",
+    scene = list(
+      xaxis = list(title = "Distance to NFT"),
+      yaxis = list(title = "Distance to HGSC"),
+      zaxis = list(title = "Distance to Meso")
+    )
+  )
+
+fig
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+df_3ref_long <- df_3ref %>%
+  dplyr::select(sample, Molecular_Subtype, dist_to_NFT, dist_to_HGSC, dist_to_Meso) %>%
+  pivot_longer(
+    cols = c("dist_to_NFT", "dist_to_HGSC", "dist_to_Meso"),
+    names_to = "Reference",
+    values_to = "Distance"
+  )
+
+# Optionally rename the references for a cleaner facet label
+df_3ref_long <- df_3ref_long %>%
+  mutate(Reference = recode(Reference,
+                            "dist_to_NFT"  = "To NFT",
+                            "dist_to_HGSC" = "To HGSC",
+                            "dist_to_Meso" = "To Mesothelium"))
+df_3ref_long$Reference <- factor(df_3ref_long$Reference, 
+                                 levels = c("To NFT", "To HGSC", "To Mesothelium"))
+df_3ref_long$Molecular_Subtype <- factor(df_3ref_long$Molecular_Subtype, levels = c("Dormant", "Mixed", "Immunoreactive", "Proliferative"))
+
+
+ggplot(df_3ref_long, aes(x = Molecular_Subtype, y = Distance, fill = Molecular_Subtype)) +
+  geom_boxplot(outlier.shape = NA) +
+  facet_wrap(~ Reference, nrow = 1) +  # Facet by reference if needed
+  labs(
+    title = "Molecular Distance",
+    x = "Molecular Subtype",   # You can adjust the x-label as needed
+    y = "Euclidean Distance"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    axis.title = element_text(size = 12),
+    strip.text = element_text(size = 12, face = "bold")
+  ) +
+  # Rename the x-axis categories: 
+  scale_x_discrete(labels = c("Dormant" = "D", "Mixed" = "M", "Immunoreactive" = "I", "Proliferative" = "P")) +
+  # And assign fill colors that match the new order 
+  scale_fill_manual(
+    values = c("Dormant" = "steelblue2", 
+               "Mixed" = "#74c476", 
+               "Immunoreactive" = "orange",  
+               "Proliferative" = "#e41a1c"),   
+    guide = "none"
+  )
+
+comparisons <- list(
+  c("Dormant", "Mixed"), 
+  c("Mixed", "Immunoreactive"), 
+  c("Immunoreactive", "Proliferative")   
+)
+
+
+# Create the faceted boxplot with pairwise comparisons
+library(ggplot2)
+library(ggpubr)
+
+P_dist<- ggplot(df_3ref_long, aes(x = Molecular_Subtype, y = Distance, fill = Molecular_Subtype)) +
+  geom_boxplot(outlier.shape = NA) +
+  facet_wrap(~ Reference, nrow = 1) +
+  labs(
+    title = "Molecular Distance",
+    x = "Molecular Subtype",
+    y = "Euclidean Distance"
+  ) +
+  scale_y_continuous(limits = c(5, 46))  +
+  theme_bw() +
+  theme(
+    plot.title  = element_text(hjust = 0.5, face = "bold", size = 14),
+    axis.title  = element_text(size = 12),
+    strip.text  = element_text(size = 12, face = "bold")
+  ) +
+  # Rename x-axis tick labels from factor values to your preferred abbreviations
+  scale_x_discrete(labels = c("Dormant" = "D", "Mixed" = "M", "Immunoreactive" = "I", "Proliferative" = "P")) +
+  # Set fill colors (the names must match the factor levels)
+  scale_fill_manual(
+    values = c("Dormant" = "steelblue2", 
+               "Mixed" = "#74c476", 
+               "Immunoreactive" = "orange",  
+               "Proliferative" = "#e41a1c"), 
+    guide = "none"
+  ) +
+  # Add pairwise comparisons:
+  stat_compare_means(
+    data = subset(df_3ref_long, Reference %in% c("To NFT", "To HGSC", "To Mesothelium")),
+    comparisons = comparisons,
+    method = "t.test",
+    label = "p.signif",  
+    hide.ns = FALSE,         
+  )+
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 16),   
+      axis.text.x = element_text(size = 10),   
+      axis.text.y = element_text(size = 10),   
+      axis.title = element_text(size = 14)
+    )
+
+#ggsave(filename = paste0(directory, "/NMF/NO_NFT_HGSC/Cluster4/Molecular_distance_re.png"),
+#         plot = P_dist, width = 6, height = 4, dpi = 300)
+
+
+############################3D
+library(plotly)
+library(dplyr)
+library(geometry)  
+library(colorspace) 
+group_colors <- c("Dormant" = "#1f77b4", 
+                  "Mixed" = "#74c476", 
+                  "Immunoreactive" = "orange", 
+                  "Proliferative" = "#e41a1c")
+
+selected_clusters <- c("Dormant", "Mixed", "Immunoreactive", "Proliferative")
+dark_cluster_colors <- darken(group_colors, amount = 0.8)
+centers_md_3d <- df_3ref %>%
+  group_by(Molecular_Subtype) %>%
+  summarize(
+    md1_center = median(dist_to_NFT, na.rm = TRUE),
+    md2_center = median(dist_to_HGSC, na.rm = TRUE),
+    md3_center = median(dist_to_Meso, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(label = as.character(Molecular_Subtype))
+
+# Create the base 3D scatter plot for molecular distances:
+distance_3d_plot <- plot_ly(
+  data = df_3ref,
+  x = ~dist_to_NFT,
+  y = ~dist_to_HGSC,
+  z = ~dist_to_Meso,
+  type = "scatter3d",
+  mode = "markers",
+  marker = list(size = 3, opacity = 0.8),
+  color = ~`Molecular_Subtype`,
+  colors =group_colors[selected_clusters]
+)  %>%
+  # Text labels for centers:
+  add_trace(data = centers_md_3d,
+            x = ~md1_center, y = ~md2_center, z = ~md3_center,
+            type = "scatter3d",
+            mode = "text",
+            text = ~label,
+            textposition = "center",
+            textfont = list(
+              size = 16,
+              color = dark_cluster_colors[as.character(centers_pca_3d$`Molecular Subtype`)]
+            )
+  )%>%
+  layout(
+    paper_bgcolor = "white",
+    plot_bgcolor  = "white",
+    showlegend = FALSE,
+    scene = list(
+      xaxis = list(
+        title = "Distance to NFT",
+        showgrid = TRUE,
+        zeroline = TRUE,
+        showline = TRUE,
+        linecolor = "black",
+        linewidth = 3,
+        backgroundcolor = "white"
+      ),
+      yaxis = list(
+        title = "Distance to HGSC",
+        showgrid = TRUE,
+        zeroline = TRUE,
+        showline = TRUE,
+        linecolor = "black",
+        linewidth = 3,
+        backgroundcolor = "white"
+      ),
+      zaxis = list(
+        title = "Distance to Meso",
+        showgrid = TRUE,
+        zeroline = TRUE,
+        showline = TRUE,
+        linecolor = "black",
+        linewidth = 3,
+        backgroundcolor = "white"
+      ),
+      camera = list(
+        eye = list(x = 1.8, y = 1.8, z = 1.8)
+      )
+    ),
+    title = ""  # No title
+  )
+
+
+
+unique_subtypes <- levels(as.factor(df_3ref$Molecular_Subtype))
+for(cl in unique_subtypes) {
+  pts <- df_3ref %>% filter(Molecular_Subtype == cl)
+  if(nrow(pts) >= 4) {
+    hull <- convhulln(as.matrix(pts[, c("dist_to_NFT", "dist_to_HGSC", "dist_to_Meso")]), options = "Qt")
+    distance_3d_plot <- distance_3d_plot %>% add_trace(
+      type = "mesh3d",
+      x = pts$dist_to_NFT,
+      y = pts$dist_to_HGSC,
+      z = pts$dist_to_Meso,
+      i = hull[,1] - 1,
+      j = hull[,2] - 1,
+      k = hull[,3] - 1,
+      opacity = 0.03,
+      name = cl,
+      showscale = FALSE,
+      facecolor = rep(group_colors[cl], nrow(hull))
+    )
+  }
+}
+
+
+distance_3d_plot
+```
+
+
+# Stroma DE (Supplemental Figure 2A)
+```{r}
+pheno = new("AnnotatedDataFrame", data=anno_data.stroma)
+pheno$Molecular_Subtype <- as.factor(pheno$Molecular_Subtype)
+design = model.matrix(~0 + pheno$Molecular_Subtype)
+colnames(design) <- levels(pheno$Molecular_Subtype)
+
+contr.matrix <- makeContrasts(
+  HGSCvsSTIC = HGSC - (Mixed + Proliferative + Dormant + Immunoreactive)/4,
+  M_NFT = Mixed - NFT,
+  P_NFT = Proliferative - NFT,
+  D_NFT = Dormant - NFT, 
+  I_NFT = Immunoreactive - NFT,
+  STIC_NFT = (Mixed + Proliferative + Dormant + Immunoreactive)/4 - NFT,
+  STIC_nodormant_NFT = (Mixed + Proliferative + Immunoreactive)/3 - NFT,
+  levels = colnames(design))
+
+eset = ExpressionSet(assayData = as.matrix(count_data.stroma), phenoData = pheno)
+edata = Biobase::exprs(eset)
+fit <- lmFit(eset, design)
+vfit <- contrasts.fit(fit, contrasts=contr.matrix)
+efit <- eBayes(vfit)
+
+HGSCvsSTIC <- topTreat(efit, coef=1, n=Inf)
+M_NFT <- topTreat(efit, coef = "M_NFT", n = Inf)
+P_NFT <- topTreat(efit, coef = "P_NFT", n = Inf)
+D_NFT <- topTreat(efit, coef = "D_NFT", n = Inf)
+I_NFT <- topTreat(efit, coef = "I_NFT", n = Inf)
+STIC_nodormant_NFT<- topTreat(efit, coef = "STIC_nodormant_NFT", n = Inf)
+STIC_NFT<- topTreat(efit, coef = "STIC_NFT", n = Inf)
+
+plot_DE(HGSCvsSTIC, "HGSC", "STIC")
+plot_DE(D_NFT, "Dormant", "NFT")
+plot_DE(M_NFT, "Mixed", "NFT")
+plot_DE(I_NFT, "Immunoreactive", "NFT")
+plot_DE(P_NFT, "Proliferative", "NFT")
+plot_DE(STIC_NFT, "STIC", "NFT")
+plot_DE(STIC_nodormant_NFT, "PIMSTIC", "NFT")
+
+
+gene_list <- c("F3","GGT6","C1QB","STAB1","CD163","TMEM123","RPP40","APOE","C3","TYROBP","C1QA","SOD2","SPP1","IFI44L","MX1","TIMP1","BGN")
+p1 <- plot_DE_list2(HGSCvsSTIC, title_1 = "HGSC", title_2 = "STIC (Stroma)", gene_list = gene_list) +
+    theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),   # Center and bold title
+    axis.text.x = element_text(size = 12),   # Rotate x-axis text
+    axis.text.y = element_text(size = 12),   # Adjust y-axis text size
+    axis.title = element_text(size = 14),  # Adjust axis title size
+  ) 
+ggsave(filename = paste0(root, "/output/figures/02_sup_stroma/Stroma_HGSC_STIC.png"), plot = p1, width = 6, height = 6, dpi = 300)
+```
+### Stroma pathway (Supplemental Figure 2B)
+```{r}
+pathways.hallmark <- gmtPathways(file.path(root, "R/h.all.v2023.2.Hs.entrez.gmt"))
+
+geneSymbols <- rownames(HGSCvsSTIC)
+foldchanges <- HGSCvsSTIC$logFC
+entrezIDs <- mapIds(org.Hs.eg.db,
+                    keys = geneSymbols,
+                    column = 'ENTREZID',
+                    keytype = 'SYMBOL',
+                    multiVals = 'first')
+names(foldchanges) <- entrezIDs
+foldchanges <- foldchanges[!is.na(names(foldchanges))]
+
+fgseaRes <- fgsea(pathways.hallmark, stats=foldchanges)
+
+fgseaResTidy <- fgseaRes %>%
+  as_tibble() %>%
+  arrange(NES)
+
+fgseaResTidy_fil <- fgseaResTidy %>%
+  dplyr::select(1, 3, 6) %>%
+  as_tibble() %>%
+  arrange(NES)
+
+# Select top 20 by NES
+top20 <- fgseaResTidy_fil %>% 
+  slice_head(n = 15)
+
+# Select bottom 20 by NES
+bottom20 <- fgseaResTidy_fil%>% 
+  slice_tail(n = 15)
+
+# Combine top and bottom 20 into one table
+top_and_bottom <- bind_rows(top20, bottom20)
+top_and_bottom <- top_and_bottom %>%
+  mutate(pathway = gsub("HALLMARK", "", pathway),       # Remove "HALLMARK_"
+         pathway = gsub("_", " ", pathway))  
+# View the result
+top_and_bottom
+
+de <- "HGSC/STIC (Stroma)"
+
+p <- ggplot(top_and_bottom, aes(reorder(pathway, NES), NES)) + 
+  geom_col(aes(fill = padj < 0.05)) + 
+  coord_flip() + 
+  labs(x = "Pathway", y = "Normalized Enrichment Score", 
+       title = de) + 
+  theme_bw() +
+  scale_fill_manual(name = "P-value", 
+                    values = c("TRUE" = "orange", "FALSE" = "steelblue2"),
+                    labels = c("TRUE" = "p < 0.05", "FALSE" = "p ≥ 0.05"))
+
+ p + theme(
+  plot.title = element_text(hjust = 0.5, face = "bold", size = 16),  # Center and bold title
+  axis.text.x = element_text(size = 12),  # X-axis text size
+  axis.text.y = element_text(size = 10),  # Y-axis text size
+  axis.title = element_text(size = 14)    # Axis title size
+)
+p_adj <-p + theme(
+  plot.title = element_text(hjust = 0.5, face = "bold", size = 16),  # Center and bold title
+  axis.text.x = element_text(size = 12),  # X-axis text size
+  axis.text.y = element_text(size = 10),  # Y-axis text size
+  axis.title = element_text(size = 14)    # Axis title size
+)
+# # Save the plot
+ggsave(filename = paste0(root, "/output/figures/02_sup_stroma/pathway_stroma_HGSCvsSTIC.png"), plot = p_adj, width = 6, height = 6, dpi = 300)
+```
+### Stroma lymphocyte percentage (Supplemental Figure 2C)
+```{r}
+percentage_data <- with(anno_data.stroma, prop.table(table(Diagnosis, Stromal_lymphocyte), margin = 1))
+
+# Convert to data frame
+percentage_data <- as.data.frame(percentage_data)
+
+
+# Define custom colors for TIL levels
+Stromal_lymphocyte_colors <- c(
+  'Non-enriched' = "#FF9999",
+  'Enriched' = "#CC0000"
+)
+
+
+percentage_data <- percentage_data %>%
+  mutate(
+    Diagnosis = factor(Diagnosis,
+                       levels = c("NFT", "p53", "STIC", "HGSC"))
+  )
+
+p <- ggplot(percentage_data, aes(x = Diagnosis, y = Freq, fill = Stromal_lymphocyte)) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = ifelse(Freq>0, paste0(round(Freq*100,1),"%"),"")),
+            position = position_stack(vjust = 0.5), size = 4, fontface = "bold") +
+  scale_fill_manual(values = c("Enriched"="#CC0000", "Non-enriched"="#FF9999"),
+                    name = "Stromal Lymphocyte") +
+  labs(
+    title = "Stromal Lymphocyte Enrichment by Diagnosis",
+    x     = NULL,
+    y     = "Percentage"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title            = element_blank(),
+    axis.text.x           = element_text(size = 12),
+    axis.text.y           = element_text(size = 12),
+    legend.position       = "right",
+    legend.title          = element_text(size = 12),
+    legend.text           = element_text(size = 10),
+    panel.grid.major.x    = element_blank(),
+    panel.grid.major.y    = element_line(color = "grey80")
+  )
+
+print(p)
+ggsave(filename = paste0(root, "/output/figures/02_sup_stroma/TIL_Diagnosis.png", sep = ""), plot = p, width = 6, height = 6, dpi = 300)
+```
+
+## Table.S2
+```{r}
+desired_subtype_order <- c("NFT", "Dormant","Mixed","Immunoreactive","Proliferative", "HGSC")
+
+table_subtypes <- anno_data %>%
+  filter(type == "epithelium", !is.na(Molecular_Subtype)) %>%
+  mutate(Molecular_Subtype = factor(Molecular_Subtype, levels = desired_subtype_order)) %>%
+  dplyr::count(FTE, Molecular_Subtype, name = "Count") %>%
+  pivot_wider(
+    names_from  = Molecular_Subtype,
+    values_from = Count,
+    values_fill = 0
+  ) %>%
+  rename(Patient = FTE) %>%
+  # ensure columns appear exactly in desired order (even if some were absent)
+  mutate(across(all_of(setdiff(desired_subtype_order, names(.))), ~0)) %>%
+  select(Patient, all_of(desired_subtype_order))
+
+table_subtypes
+write.csv(table_subtypes, paste0(root,"/output/tables/table_subtypes.csv"), row.names = FALSE)
+```
+
+
+
+
